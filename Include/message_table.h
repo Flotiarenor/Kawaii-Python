@@ -27,13 +27,6 @@ extern "C" {
  */
 PyAPI_FUNC(PyObject *) _PyErr_Message_Replace(PyObject *value);
 
-/*
- * Decode a hex string (UTF-8 bytes, as produced by bytes.hex()) into a str.
- * Returns NULL with an exception set for NULL input, an odd length, or a
- * non-hex character.
- */
-PyAPI_FUNC(PyObject *) PyUnicode_FromHex(const char *hex);
-
 /* Reload the cached table from disk.  Returns the number of entries loaded
    (0 when no table is configured or readable).  Intended for tests. */
 PyAPI_FUNC(Py_ssize_t) _PyMessageTable_Reload(void);

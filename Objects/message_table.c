@@ -119,9 +119,12 @@ hex_digit(int ch)
  * Validates the input: NULL, an odd length or a non-hex character returns NULL
  * with an exception set instead of silently decoding garbage.  (The original
  * version decoded first and only then looked at the length.)
+ *
+ * File-local on purpose: exporting it would add a public-looking C API that
+ * needs documentation, for no gain -- nothing outside this file calls it.
  */
-PyObject *
-PyUnicode_FromHex(const char *hex)
+static PyObject *
+from_hex(const char *hex)
 {
     if (hex == NULL) {
         PyErr_SetString(PyExc_ValueError, "hex string is NULL");
@@ -269,7 +272,7 @@ message_table_load(void)
             continue;
         }
 
-        PyObject *value = PyUnicode_FromHex(hex);
+        PyObject *value = from_hex(hex);
         if (value == NULL) {
             /* A malformed value must never stop the interpreter from printing
                the original message: drop the entry and carry on. */
