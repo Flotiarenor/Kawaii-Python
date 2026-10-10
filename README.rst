@@ -1,5 +1,11 @@
-This is Python version 3.15.0
-=============================
+This is Python version 3.15.0 (unofficial build, modified error messages)
+=========================================================================
+
+.. warning::
+
+   This is **not** the official Python distribution: it is a personal fork of
+   CPython v3.15.0 and is not supported or endorsed by the Python Software
+   Foundation.  See `FORK-NOTICE.md <FORK-NOTICE.md>`_ for what was changed.
 
 .. image:: https://github.com/python/cpython/actions/workflows/build.yml/badge.svg?branch=main&event=push
    :alt: CPython build status on GitHub Actions
@@ -28,6 +34,9 @@ General Information
 - Issue tracker: https://github.com/python/cpython/issues
 - Documentation: https://docs.python.org
 - Developer's Guide: https://devguide.python.org/
+
+For this fork specifically, see `FORK-NOTICE.md <FORK-NOTICE.md>`_
+(upstream issues belong at the upstream tracker above, not here).
 
 Contributing to CPython
 -----------------------
