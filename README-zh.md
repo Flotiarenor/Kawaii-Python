@@ -43,10 +43,6 @@ ZeroDivisionError: 笨蛋才会把0放到除数吧！
 | Linux x64 | `Kawaii-Python-3.15.0-linux-x64.tar.gz` | 解压后运行其中的 `bin/python3` |
 | Linux x64 | `Kawaii-Python-3.15.0-linux-x64.zip` | 同上，只是压缩格式不同 |
 
-> [!NOTE]
-> 上表是发布产物的命名约定；**第一个 Release 发布前，这些包还不存在**，请按
-> [docs/development.md](docs/development.md) 从源码构建。
-
 Windows 安装包由 CPython 自带的 WiX 工程生成，行为和官方安装程序一致：默认装到当前用户的
 `%LocalAppData%\Programs\Python\Python315`，可以勾选加入 PATH，可以在「应用和功能」里卸载。
 它**与官方 Python 3.15 并存安装，不会覆盖你已经装好的 Python**。
@@ -118,17 +114,17 @@ $ python -c "print(input().encode('utf-8').hex())"
 
 ## 哪些消息换不了
 
-有几种异常，你的条目会被查到，但**改写后反而会显示得更糟，所以程序保留原文**——这是设计，
+有几种异常，你给它们写条目也没用——程序**保留原文**，因为改写后反而会显示得更糟。这是设计，
 不是坏了：
 
 | 异常 | 结果 | 原因 |
 | --- | --- | --- |
 | `ZeroDivisionError`、`IndexError`、`TypeError`、`AttributeError`、`NameError` 等 | 替换 | 显示的就是报错原文 |
-| `SyntaxError` | 替换，行列位置保留 | 文案单独存放，位置字段一并搬运 |
-| `KeyError` | 保留原文 | 显示的是参数本身，改写后会多出一对引号 |
-| 带 `errno` 的 `OSError` / `FileNotFoundError` 等 | 保留原文 | 显示由错误号和文件名拼出，改写会丢掉它们 |
+| `SyntaxError`，**只有单个参数**那种（如 `raise SyntaxError('msg')`） | 替换 | 显示的就是报错原文 |
+| `KeyError` | 保留原文 | 显示的是 `args[0]` 的 repr，改写后会多出一对引号 |
+| 带 `errno` 的 `OSError` / `FileNotFoundError` 等 | 表里有专门的模式键，但保留原文 | 显示由错误号和文件名拼出，改写会丢掉它们 |
 | `UnicodeDecodeError` | 保留原文 | 显示由编码、位置等信息拼出 |
-| `Exception(1, 2)` 这类多参数异常 | 保留原文 | 显示的是参数本身 |
+| `Exception(1, 2)` 这类多参数异常 | 保留原文 | 显示的是参数元组的 repr |
 | 自己写了 `__str__` 的异常子类 | 保留原文 | 显示文本是固定的 |
 
 ## 常见问题
@@ -142,7 +138,7 @@ $ python -c "print(input().encode('utf-8').hex())"
 
 **为什么有的条目明明在表里，显示出来还是英文？**
 见上一节：`KeyError`、带 `errno` 的 `OSError`、`UnicodeDecodeError` 和自定义 `__str__` 的类型
-属于"查到了但不改"。给它们写任何条目都不会生效。
+不会采用改写。给它们写条目也不会生效。
 
 **它会替换掉我电脑上的 Python 吗？**
 不会。安装包与官方 Python 3.15 并存安装，装在自己的目录里，卸载也只删自己的文件。

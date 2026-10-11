@@ -46,11 +46,6 @@ Get the package for your platform from
 | Linux x64 | `Kawaii-Python-3.15.0-linux-x64.tar.gz` | Unpack and run the `bin/python3` inside |
 | Linux x64 | `Kawaii-Python-3.15.0-linux-x64.zip` | Same, different compression |
 
-> [!NOTE]
-> The table above is the naming convention for release artifacts; **until the first release is
-> published those packages do not exist yet** — build from source as described in
-> [docs/development.md](docs/development.md).
-
 The Windows installer is produced by CPython's own WiX project, so it behaves like the official
 one: it installs into `%LocalAppData%\Programs\Python\Python315` for the current user, offers the
 "add to PATH" option, and can be uninstalled from Apps & features. It installs **alongside official
@@ -132,17 +127,17 @@ Two things to remember about the table:
 
 ## What cannot be replaced
 
-For a few exceptions your entry is found, but rewriting it would display something worse than the
-original, so the original is kept. This is by design, not a failure:
+For a few exceptions an entry you write has no effect: the original is kept, because a rewrite would
+display something worse. This is by design, not a failure:
 
 | Exception | Result | Why |
 | --- | --- | --- |
 | `ZeroDivisionError`, `IndexError`, `TypeError`, `AttributeError`, `NameError`, … | replaced | the display is the original message |
-| `SyntaxError` | replaced, line and column kept | the text is stored separately; the location is carried over |
-| `KeyError` | original kept | the display is the argument itself, and a rewrite would add a pair of quotes |
-| `OSError` / `FileNotFoundError`, … with `errno` | original kept | the display is built from the error number and the file name, which a rewrite would drop |
+| `SyntaxError` **with a single argument** (e.g. `raise SyntaxError('msg')`) | replaced | the display is the original message |
+| `KeyError` | original kept | the display is `repr(args[0])`, and a rewrite would add a pair of quotes |
+| `OSError` / `FileNotFoundError`, … with `errno` | a pattern key covers it, but the original is kept | the display is built from the error number and the file name, which a rewrite would drop |
 | `UnicodeDecodeError` | original kept | the display is built from the encoding and positions |
-| `Exception(1, 2)` and other multi-argument exceptions | original kept | the display is the arguments themselves |
+| `Exception(1, 2)` and other multi-argument exceptions | original kept | the display is the tuple repr |
 | exception subclasses with their own `__str__` | original kept | the display text is fixed |
 
 ## FAQ
@@ -157,7 +152,7 @@ the first key. Finally **restart Python**: the table is read once, on first use.
 
 **Some entries are in the table but the message is still in English.**
 See the section above: `KeyError`, `OSError` with `errno`, `UnicodeDecodeError` and types with a
-custom `__str__` are "found, then left alone". No entry can take effect for them.
+custom `__str__` never adopt a rewrite. Writing an entry for them has no effect.
 
 **Will it replace the Python on my machine?**
 No. The installer puts it in its own directory alongside official Python 3.15, and uninstalling

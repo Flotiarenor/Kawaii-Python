@@ -258,7 +258,8 @@ division by zero	e7aca8e89b8be6898de4bc9ae68a8a30e694bee588b0e999a4e695b0e590a7e
 | --- | --- | --- |
 | `ZeroDivisionError`、`IndexError`、`TypeError`、`AttributeError`、`NameError`、`RecursionError`、`ImportError` 等 | 替换 | 显示文本就是 `args[0]` |
 | 继承标准 `__str__` 的子类 | 替换 | 同上 |
-| `SyntaxError` | 替换，位置保留 | 文本在 `.msg` 里，`filename`、`lineno`、`offset`、`text` 与结束位置一并搬运 |
+| `SyntaxError`，单个参数 | 替换 | 显示文本就是 `args[0]` |
+| `SyntaxError`，多参数（`compile()`、`exec()`、导入文件时产生的就是这种） | **不替换** | 见下方"已知缺陷" |
 | `KeyError` | 表里查到了，但保留原文 | 显示文本是 `repr(args[0])`，改写后会多出引号 |
 | 带 `errno` 的 `OSError` 及其子类 | 表里查到了，但保留原文 | 显示文本由 `errno`／`strerror`／`filename` 拼出 |
 | `UnicodeDecodeError` | 表里查到了，但保留原文 | 显示文本由 `encoding/object/start/end/reason` 拼出，用 `__new__` 造的副本没有 `object` 成员 |
@@ -284,6 +285,35 @@ division by zero	e7aca8e89b8be6898de4bc9ae68a8a30e694bee588b0e999a4e695b0e590a7e
 [AGENTS.md](../AGENTS.md) 与 [.dsh/commit-conventions.md](../.dsh/commit-conventions.md)：
 C / Python 源码里的注释、docstring、命名一律英文，`Doc/**`、`Lib/**` 等上游文件不翻译，
 只有治理文档与本文件用中文。
+
+## 已知缺陷：多参数 SyntaxError 不会被替换
+
+`SyntaxError` 有两种形态，只有一种能被表改写：
+
+| 形态 | `args` | 是否替换 |
+| --- | --- | --- |
+| `raise SyntaxError('invalid syntax')` | `('invalid syntax',)` | 替换 |
+| `raise SyntaxError('invalid syntax', ('<demo>', 1, 4, '1 +'))`，以及解析器产生的全部——`compile()`、`exec()`、`import`、REPL 输入 | `('invalid syntax', ('<demo>', 1, 4, ...))` | **不替换** |
+
+复现（表里放 `invalid syntax<TAB>` 加任意文案的十六进制）：
+
+```console
+$ .\PCbuild\amd64\python.exe -c "raise SyntaxError('invalid syntax')"
+SyntaxError: 【替换】            # 生效
+$ .\PCbuild\amd64\python.exe -c "compile('1 +', '<demo>', 'exec')"
+SyntaxError: invalid syntax     # 不生效
+```
+
+`_PyErr_Message_Replace()` 对第二种返回 `NULL`。用 ctypes 直接调 `python315.dll` 里的它，
+凡是 `filename` 与 `lineno` 同时非 `None` 的 `SyntaxError` 都失败；只设 `offset`、`text`、
+`end_lineno` 或 `end_offset` 则成功。在 Python 里逐步复刻
+`exception_with_message()`（`__new__`、替换 `args[0]`、设 `.msg`、搬六个位置字段、再比较
+`str(copy)` 与替换文本）**全部通过**，得到 `【替换】 (<demo>, line 1)`，所以分歧在 C 那条路径
+内部，不在闸门的判定标准。未继续定位，未尝试修复。
+
+影响：日常遇到的语法错误都是多参数形态，所以文档里承诺的 `SyntaxError` 替换对它们不成立。
+单参数形态本来就没有位置信息可丢，所以早期"改写会保留文件与行号"的说法描述的是一个不可能
+发生的情形；README 现在写明覆盖的是哪种形态。
 
 ## 已知未做
 

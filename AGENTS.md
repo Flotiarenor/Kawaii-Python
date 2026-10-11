@@ -148,9 +148,11 @@
    `division by zero` 与 `list index out of range` 这两条要保持可用（README 与
    [FORK-NOTICE.md](FORK-NOTICE.md) 的示例以它们为依据；注意 `[][0]` 不是键，`IndexError` 的键是
    `list index out of range`）。
-   **验收要看"副本显示成什么"**：改写只在副本的显示恰好等于新文本时才生效（`SyntaxError`
-   按"以新文本开头"放行），`KeyError`、带 errno 的 `OSError`、`UnicodeDecodeError` 与自定义
-   `__str__` 的类型会被这道闸门挡下、保留原文——这是设计，不是失败。
+   **验收要看"副本显示成什么"**：改写只在副本的显示恰好等于新文本时才生效；`KeyError`、带
+   errno 的 `OSError`、`UnicodeDecodeError` 与自定义 `__str__` 的类型会被这道闸门挡下、保留
+   原文——这是设计，不是失败。闸门里另有一条"以新文本开头即放行"的分支是给 `SyntaxError` 留的
+   （它会在文案后面追加 `(<file>, line N)`），但**多参数 SyntaxError 根本走不到那一步**，见下方
+   的已知缺陷。
 4. `git status` 确认没把构建产物与日志带进提交。
 
 ## 提交信息规范
@@ -258,6 +260,13 @@ fix(message-table): 修正 REPL 下不替换异常信息的情形
 
 ## 已知文档债（改到相关文件时顺手对齐）
 
+- **多参数 `SyntaxError` 不会被替换**（`compile()`、`exec()`、`import`、REPL 输入产生的都是这种；
+  只有 `raise SyntaxError('msg')` 那种单参数形态会）。v3.15.0 实测：`_PyErr_Message_Replace()`
+  对 `filename` 与 `lineno` 同时非 `None` 的 `SyntaxError` 返回 `NULL`，而逐步复刻
+  `exception_with_message()` 却全部通过，说明分歧在 C 路径内部；未定位、未修复。完整复现与影响
+  见 [FORK-NOTICE.md](FORK-NOTICE.md) 的 "Known defect" 与
+  [docs/development.md](docs/development.md) 的"已知缺陷"。改这条路径前先读那两节，别照着
+  README 里"SyntaxError 能替换"的旧说法做验证。
 - [Include/message_table.h](Include/message_table.h) 第 4 行的注释写着"见 `attach.patch`"，这个
   文件在仓库里不存在，指向它的句子应当改掉。改这句话要动 C 头文件，按上面第 1 步必须真实
   构建一次，不要只为文案顺手改。

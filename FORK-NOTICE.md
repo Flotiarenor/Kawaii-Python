@@ -146,7 +146,7 @@ all.
 | --- | --- | --- |
 | `ZeroDivisionError`, `IndexError`, `TypeError`, `AttributeError`, `NameError`, `RecursionError`, `ImportError`, … | replaced | the display is `args[0]` |
 | subclasses that inherit the standard `__str__` | replaced | same |
-| `SyntaxError` | replaced, location kept | text lives in `.msg`; `filename`, `lineno`, `offset`, `text` and the end positions are copied over, so the display is `new text (file, line N)` |
+| `SyntaxError` **with a single argument** | replaced | the display is `args[0]`; the multi-argument form the compiler produces (`compile()`, `exec()`, an imported file) is **not** replaced — see "Known defect" below |
 | `KeyError` | found in the table, then left alone | the display is `repr(args[0])`: the rewrite would print `'<new text>'` |
 | `OSError` / `FileNotFoundError`, … with `errno` | found in the table, then left alone | the display is built from `errno`/`strerror`/`filename`; the copy would print a tuple and lose all three |
 | `UnicodeDecodeError` | found in the table, then left alone | the display is built from `encoding/object/start/end/reason`, and a copy made with `__new__` has no `object` member, so it displays an empty string |
@@ -158,6 +158,40 @@ reachable, and the rewrite is discarded because it would print something worse
 than the original.  `Objects/exceptions.c:3867` (empty `UnicodeDecodeError`
 copy) and `:2927` (where `SyntaxError` renders its location) are the upstream
 lines behind the two most surprising rows.
+
+## Known defect: multi-argument SyntaxError is never replaced
+
+`SyntaxError` reaches the table in two shapes, and only one of them works:
+
+| Shape | `args` | Replaced? |
+| --- | --- | --- |
+| `raise SyntaxError('invalid syntax')` | `('invalid syntax',)` | yes |
+| `raise SyntaxError('invalid syntax', ('<demo>', 1, 4, '1 +'))`, and everything the parser produces — `compile()`, `exec()`, `import`, REPL input | `('invalid syntax', ('<demo>', 1, 4, ...))` | **no** |
+
+Reproduce (table containing `invalid syntax<TAB>` plus the hex of any text):
+
+```console
+$ python -c "raise SyntaxError('invalid syntax')"
+SyntaxError: 【替换】            # works
+$ python -c "compile('1 +', '<demo>', 'exec')"
+SyntaxError: invalid syntax     # not replaced
+```
+
+`_PyErr_Message_Replace()` returns `NULL` for the second shape.  Calling it
+directly (ctypes, `python315.dll`) on a `SyntaxError` whose `filename` and
+`lineno` are both non-`NULL` reproduces it; setting only `offset`, `text`,
+`end_lineno` or `end_offset` still succeeds.  Replaying
+`exception_with_message()`'s steps in Python — `__new__`, replace `args[0]`,
+set `.msg`, copy the six location fields, then compare `str(copy)` with the
+replacement — succeeds and yields `【替换】 (<demo>, line 1)`, so the divergence
+is inside the C path and not in the gate's expectation.  Not diagnosed further;
+no fix attempted.
+
+Impact: syntax errors in everyday use are the multi-argument form, so the
+documented `SyntaxError` replacement effectively does not happen for them.  The
+single-argument form has no location to lose, so the earlier claim that a
+rewrite keeps file and line was describing a case that cannot occur — the
+README now states which shape is covered.
 
 ## Verified
 
