@@ -22,6 +22,11 @@ has no message catalogue, so the same idea needs a hook in the interpreter and a
 lookup table; that table ships with this repository and is part of what you
 install.
 
+This file records what differs from upstream and what was verified.  Building the
+interpreter, producing the Windows installer, and the full format of the table are
+in [docs/development.md](docs/development.md) (Chinese); the user-facing
+introduction is [README.md](README.md) / [README-zh.md](README-zh.md).
+
 ## The feature
 
 Exception messages can be replaced through an external text table.  The table is
@@ -30,13 +35,13 @@ replacement`; the separator is a tab, and the replacement text is Chinese with
 full-width punctuation:
 
 ```
-division by zero<TAB>e7aca8e89b8be6898de4bc9ae68a8a30e694bee588b0e999a4e695b0e590a721
+division by zero<TAB>e7aca8e89b8be6898de4bc9ae68a8a30e694bee588b0e999a4e695b0e590a7efbc81
 ```
 
 A key containing `*` is a pattern instead of literal text: it matches the message
-the exception displays, every `*` captures a run of characters (non-greedy,
-numbered in order), and the replacement refers to the captures as `%1`, `%2`.
-One pattern therefore covers every value the interpreter can put into a message:
+the exception displays, every `*` captures a run of characters, and the
+replacement refers to the captures as `%1`, `%2`.  One pattern therefore covers
+every value the interpreter can put into a message:
 
 ```
 '*' object has no attribute '*'<TAB>2725312720e5afb9e8b1a1e6b2a1e69c89e5b19ee680a72027253227
@@ -49,9 +54,11 @@ Traceback (most recent call last):
 ZeroDivisionError: 笨蛋才会把0放到除数吧！
 ```
 
-The interactive REPL is covered too, which is the reason this needs a C hook:
-`sys.excepthook` is **not** called by the interactive loop, so a pure-Python
-implementation cannot reach that case.
+The table that ships here currently holds 4814 literal keys and 20 patterns
+(`lookup-table.txt` is 4917 lines, 83 of them blank or comments), and every entry
+quoted in this file or in the READMEs decodes to exactly the text shown there —
+including `'int' object has no attribute 'foo'`, which is not a key but the
+pattern above rendered with `int` and `foo` substituted into `%1` and `%2`.
 
 ## Where it differs from upstream
 
@@ -59,9 +66,9 @@ Six upstream files touched, two added:
 
 | File | Change |
 | --- | --- |
-| `Python/pythonrun.c` | hook in `_PyErr_Display()` |
-| `Python/pylifecycle.c` | release the cached table in `_Py_Finalize()` |
-| `Include/cpython/unicodeobject.h` | include the new header |
+| `Python/pythonrun.c` | hook in `_PyErr_Display()` (line 1149) |
+| `Python/pylifecycle.c` | release the cached table in `_Py_Finalize()` (line 2401) |
+| `Include/cpython/unicodeobject.h` | include the new header, last line of the file |
 | `Makefile.pre.in`, `PCbuild/pythoncore.vcxproj`, `PCbuild/_freeze_module.vcxproj` | build the new source |
 | **added** `Objects/message_table.c` | table loading, hex decoding, lookup, rewriting, and the "can this message be replaced" decision |
 | **added** `Include/message_table.h` | declarations |
@@ -69,11 +76,17 @@ Six upstream files touched, two added:
 `_PyErr_Display()` is the single funnel every traceback goes through — the
 REPL, `PyErr_Print`/`sys.excepthook`, `sys.__excepthook__`, and the C fallback
 that runs when the `traceback` module is unavailable.  Hooking there covers all
-of them at once.
+of them at once.  The interactive loop is the reason this cannot be done in
+Python at all: it never calls `sys.excepthook`, so a pure-Python implementation
+cannot reach that case.
 
 The implementation is plain C on public API only: it does not import Python
 code, so a traceback stays printable even if the import machinery is broken at
-that moment.
+that moment.  The new symbols (`_PyErr_Message_Replace`, `_PyMessageTable_Reload`,
+`_PyMessageTable_Fini`) carry the `_Py` prefix and stay internal; an exported
+symbol without the underscore is treated by upstream's "Check if all C APIs are
+documented" job as a new public C API, which is why the hex decoder was made
+`static` in b41bab3.
 
 ## Using it
 
@@ -86,17 +99,22 @@ The table is looked up in this order:
 The table in the repository root is the deliverable, tracked and distributed
 with the source; the interpreter itself does not probe that path, so when you
 run a build from `PCbuild/amd64/` either set `$PYTHON_MESSAGE_TABLE` or start the
-process in the repository root.  Copy the table next to the installed
-interpreter, or point `$PYTHON_MESSAGE_TABLE` at it, to ship the two together.
+process in the repository root.  The Windows installer does not place the table
+next to the interpreter either — copy it to `sys.prefix` or point
+`$PYTHON_MESSAGE_TABLE` at it.
 
 Format: UTF-8, one entry per line, blank lines and lines starting with `#` are
 ignored, the key and the value are separated by a tab.  A key may contain
 commas, spaces, quotes and brackets — everything except a tab or a line break,
 because a key has to equal the message text exactly — so the two sides are
-separated by the one character a message never contains.  A key containing `*`
-is a pattern (see [The feature](#the-feature)); a literal key always wins over a
-pattern, and among patterns the one with the fewest `*` wins.  Generate the hex
-side with:
+separated by the one character a message never contains.  The file is kept pure
+ASCII: an editor that saves it as UTF-16 would invalidate every line, and one
+that adds a BOM would prepend invisible characters to the first key.
+
+A key containing `*` is a pattern: matching is leftmost and non-greedy (every `*`
+takes the shortest run that lets the rest match), a literal key always wins over a
+pattern, and among patterns the one with the fewest `*` wins — an equal count is
+decided by the earlier line.  Generate the hex side with:
 
 ```python
 print(input().encode('utf-8').hex())
@@ -138,77 +156,29 @@ than the original.  `Objects/exceptions.c:3867` (empty `UnicodeDecodeError`
 copy) and `:2927` (where `SyntaxError` renders its location) are the upstream
 lines behind the two most surprising rows.
 
-## Building
-
-Windows:
-
-```powershell
-cd PCbuild
-.\get_externals.bat --no-tkinter
-msbuild _freeze_module.vcxproj /p:Configuration=Release /p:Platform=x64 /m
-msbuild python.vcxproj        /p:Configuration=Release /p:Platform=x64 /m
-```
-
-Do not use `msbuild pcbuild.sln /t:python`: `_tkinter` sits inside the `python`
-target, and skipping Tcl/Tk makes it fail, which fails the whole target even
-though `python.vcxproj` only needs `pythoncore.vcxproj`.
-
-Build `_freeze_module` first.  `pythoncore` includes
-`Python/frozen_modules/*.h`, which that project generates, and only a
-solution-level dependency orders them — building `python.vcxproj` alone fails
-with `getpath.h: No such file or directory` on a tree where the generated headers
-are absent (they are not tracked; see `.gitignore`).  A full `pcbuild.proj` build
-additionally needs `_socket` and the other extension projects for the test
-runner; `_tkinter` will still fail without Tcl/Tk, which is expected.
-
-Unix, Linux, BSD, macOS:
-
-```bash
-./configure
-make -j
-make test
-```
-
-Copying a source tree with `robocopy` on Windows will hang: CPython ships
-symlinks (`Misc/mypy/*`), which `robocopy` follows as directories.  Use `tar`
-or `git clone`.
-
-Upstream build documentation is not copied here; it applies unchanged and lives
-at [python/cpython:README.rst](https://github.com/python/cpython/blob/v3.15.0/README.rst).
-
 ## Verified
 
-Built and tested on Windows x64 Release (VS2022, MSC 19.44) against v3.15.0;
-the checks and what each one showed:
+Built and tested on Windows x64 Release (VS2022, MSC 19.44) against v3.15.0.
+Every row below was re-checked on a Release x64 build of the current tree
+(`MSC v.1944`, 3.15.0, `heads/main:a2a6516`), together with the wildcard pattern
+engine, the display gate and the tab separator:
 
 | Case | Result |
 | --- | --- |
 | no table configured | `ZeroDivisionError: division by zero` (unchanged) |
-| `python -c "1/0"` | `ZeroDivisionError: 笨蛋才会把0放到除数吧！` |
-| `python -c "[][0]"` | `IndexError: list后面的地方，不……不可以再看了，会坏掉的，呜` |
-| interactive `>>> 1/0` | replaced |
-| `SyntaxError(..., (file, line, offset, text))` in the REPL | replaced, location kept |
-| message not in the table | unchanged |
-| `open('/nope')` | `FileNotFoundError: [Errno 2] ...` (pattern matched, rewrite discarded) |
-| custom `__str__`, `OSError` subclass, `KeyError` | matched where a pattern covers them, rewrite discarded |
-
-Every row above has since been re-checked on a Release x64 build of the current
-tree (`MSC v.1944`, 3.15.0, `heads/main:a2a6516`), together with the wildcard
-pattern engine, the display gate and the tab separator:
-
-| Case | Result |
-| --- | --- |
 | `python -c "1/0"` | `ZeroDivisionError: 笨蛋才会把0放到除数吧！` (literal key) |
-| `python -c "(1).foo"` | `AttributeError: 'int' 对象没有属性 'foo'` (pattern key, captures `int` and `foo`) |
 | `python -c "[][0]"` | `IndexError: list后面的地方，不……不可以再看了，会坏掉的，呜` |
-| `>>> 1/0` and `>>> (1).foo` in the REPL | both replaced — the interactive loop never calls `sys.excepthook` |
+| `python -c "(1).foo"` | `AttributeError: 'int' 对象没有属性 'foo'` (pattern key, captures `int` and `foo`) |
+| interactive `>>> 1/0` and `>>> (1).foo` | both replaced — the interactive loop never calls `sys.excepthook` |
+| `SyntaxError(..., (file, line, offset, text))` in the REPL | replaced, location kept |
+| `compile('1 +', ...)` | message replaced where the table covers it, location kept either way |
 | `raise ValueError('not in table')` | unchanged |
 | `open('nope-xyz')` | `FileNotFoundError: [Errno 2] ...` (pattern matched, rewrite discarded by the gate) |
 | `{}['missing']` | `KeyError: 'missing'` (same gate) |
+| custom `__str__`, `OSError` subclass, `KeyError` | matched where a pattern covers them, rewrite discarded |
 | `PYTHON_MESSAGE_TABLE` pointing at a missing file | `division by zero`, unchanged |
-| `compile('1 +', ...)` | message replaced where the table covers it, location kept either way |
 
-`Lib/test/test_message_table.py` encodes this as 10 cases and runs under
+`Lib/test/test_message_table.py` encodes these as 10 cases and runs under
 `python -m test test_message_table`; `test_exceptions`, `test_traceback`,
 `test_sys` and `test_capi.test_exceptions` (684 tests) pass unchanged.
 
@@ -233,17 +203,6 @@ assertions**; and grepping the 72 163-line log for the table's own wording
 (`笨蛋`, `喵～`, `长点心`, `人家`, `杂鱼`, `离谱`) finds nothing — the only CJK in
 it are Windows' own localized `OSError` strings.
 
-Building it also turned up a step the upstream instructions do not mention for a
-tree whose generated files are absent: `pythoncore` needs
-`Python/frozen_modules/*.h`, which are produced by the `_freeze_module` project,
-and a **solution**-level dependency is what normally orders the two.  Building
-`python.vcxproj` on its own skips it, so build `_freeze_module.vcxproj` first:
-
-```powershell
-msbuild _freeze_module.vcxproj /p:Configuration=Release /p:Platform=x64
-msbuild python.vcxproj        /p:Configuration=Release /p:Platform=x64
-```
-
 ## Upgrading to a newer CPython
 
 Do not merge this tree with upstream: the fork and upstream share no common
@@ -260,9 +219,8 @@ The differences to re-apply are the rows of the table under
 [Where it differs from upstream](#where-it-differs-from-upstream): copy
 `Objects/message_table.c` and `Include/message_table.h`, re-add the `#include`
 at the end of `Include/cpython/unicodeobject.h`, re-add the three build-system
-entries, and re-add the two call sites — one insertion at the top of
-`_PyErr_Display`, one call in `_Py_Finalize`.  The implementation file itself
-needs no changes.
+entries, and re-add the two call sites — one insertion in `_PyErr_Display`, one
+call in `_Py_Finalize`.  The implementation file itself needs no changes.
 
 ## License
 

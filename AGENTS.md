@@ -2,7 +2,9 @@
 
 本文件由支持 `AGENTS.md` 的工具（含 DSH）在工作区根目录自动加载，是本仓库对 agent 的
 完整工作约定；机器可执行的提交规则在 [.dsh/commit-conventions.md](.dsh/commit-conventions.md)，
-本文件解释为什么这么定。仓库自身的说明见 [FORK-NOTICE.md](FORK-NOTICE.md)。
+本文件解释为什么这么定。仓库自身的说明见 [FORK-NOTICE.md](FORK-NOTICE.md)，
+面向使用者的介绍见 [README-zh.md](README-zh.md)（英文版 [README.md](README.md)），开发流程见
+[docs/development.md](docs/development.md)。
 
 ## 项目要点
 
@@ -35,7 +37,7 @@
   `gcc.mo`，源头是中文项目 [gcc-hentai](https://github.com/Mosklia/gcc-hentai)）：**交付物是"译文表 + 能
   读它的解释器"**。所以根目录的 `lookup-table.txt` 是项目资产，要提交、要随源码分发，它不是本地
   用户数据，不要写进 `.gitignore`。
-- `MESSAGE_TABLE_STUB_BUILD` 分支（[Objects/message_table.c](Objects/message_table.c) 第 29、181 行）
+- `MESSAGE_TABLE_STUB_BUILD` 分支（[Objects/message_table.c](Objects/message_table.c) 第 73、1141 行）
   引用的 `py_stub_api.h` 不在仓库里，也没有任何构建目标定义这个宏：它是从 3.10 fork 带过来的
   遗留路径，当前无人编译，不要照着它做验证。
 
@@ -45,7 +47,8 @@
 | --- | --- | --- |
 | C / Python 源文件里的**注释、docstring、命名** | 英文 | 与上游一致；本 fork 新增的 C 文件与头文件目前是 0 行中文 |
 | `Doc/**`、`Lib/**` 等上游文件 | 英文 | 不要为了"本地可读"把上游文件译成中文 |
-| `FORK-NOTICE.md`、`AGENTS.md`、`.dsh/**` | 中文 | 这三个是本 fork 自己的治理文档，写给本项目的人看 |
+| `AGENTS.md`、`.dsh/**`、`README-zh.md`、`docs/**` | 中文 | 本 fork 自己的治理与开发文档，写给本项目的人看 |
+| `README.md`、`FORK-NOTICE.md` | 英文 | 面向仓库外读者的两份：使用者页与与上游的关系声明；`README.md` 与 `README-zh.md` 章节一一对应 |
 | **提交信息（subject 与正文）** | 中文 | 只此一处：`git_commit` 校验 `language: zh` |
 | 测试里的 Unicode 字面量（`Lib/test/**`） | 按测试需要 | 上游本来就有 CJK 数据，属于被测内容，不是注释 |
 | `lookup-table.txt` 的**值**（替换文本） | 中文，标点全角 | 见下方"表的写法约定" |
@@ -94,7 +97,7 @@
    | 改动落在 | 必须做 |
    | --- | --- |
    | `Objects/`、`Include/`、`Python/`、`Makefile.pre.in`、`PCbuild/**` | **真的构建一次并实跑**（见下），C 改动没有"不构建就能验证"的门禁 |
-   | `AGENTS.md`、`.dsh/`、`FORK-NOTICE.md`、`README.md`、`README-zh.md` | 只改文档，核对引用的路径、行号、命令仍然存在 |
+   | `AGENTS.md`、`.dsh/`、`FORK-NOTICE.md`、`README.md`、`README-zh.md`、`docs/**` | 只改文档，核对引用的路径、行号、命令仍然存在 |
    | `Lib/`、`Doc/` | 上游门禁照旧：`python -m test` / `make -C Doc check` |
 
 2. 构建（Windows x64 Release，VS2022）：
@@ -139,7 +142,9 @@
    `lookup-table.txt` —— 仓库根目录那份表不会自动被 `PCbuild\amd64\python.exe` 读到，验证时要么
    设 `PYTHON_MESSAGE_TABLE`，要么在仓库根目录执行。上游的补充检查是
    `.\python.bat Tools\patchcheck\patchcheck.py` 与 `.\python.bat -m test`。改动表内容时，
-   `division by zero` 与 `[][0]` 这两条要保持可用（[FORK-NOTICE.md](FORK-NOTICE.md) 的表格以它们为验证依据）。
+   `division by zero` 与 `list index out of range` 这两条要保持可用（README 与
+   [FORK-NOTICE.md](FORK-NOTICE.md) 的示例以它们为依据；注意 `[][0]` 不是键，`IndexError` 的键是
+   `list index out of range`）。
    **验收要看"副本显示成什么"**：改写只在副本的显示恰好等于新文本时才生效（`SyntaxError`
    按"以新文本开头"放行），`KeyError`、带 errno 的 `OSError`、`UnicodeDecodeError` 与自定义
    `__str__` 的类型会被这道闸门挡下、保留原文——这是设计，不是失败。
@@ -253,5 +258,9 @@ fix(message-table): 修正 REPL 下不替换异常信息的情形
 - [Include/message_table.h](Include/message_table.h) 第 4 行的注释写着"见 `attach.patch`"，这个
   文件在仓库里不存在，指向它的句子应当改掉。改这句话要动 C 头文件，按上面第 1 步必须真实
   构建一次，不要只为文案顺手改。
+- [docs/development.md](docs/development.md) 里的 `Tools\msi\build.bat -x64 --pack --test-marker`
+  与 `releaselocal.wixproj` 的 `/p:OutputName`、`/p:ReleaseUri` 组合**尚未实跑过**，是按
+  [Tools/msi/README.txt](Tools/msi/README.txt) 与工程文件写出的流程；首次真实打包后要把产物名、
+  实际路径与命令回填该节，跑不通的地方一并改掉。
 - 上游文件自带的 CJK 只出现在 `Lib/test/**` 的测试数据与 `Doc/**` 的示例里，属于既定内容，
   不要顺手"清理"。

@@ -1,154 +1,163 @@
-# Kawaii-Python — CPython 3.15.0 的非官方修改版，异常信息可替换
+# Kawaii-Python — 让 Python 的报错信息变得可爱
 
-> **这不是 Python 官方发行版。** 它是 CPython v3.15.0 的个人 fork，不受 Python Software
-> Foundation 支持或认可。本仓库只改动与"异常信息可替换"有关的部分，其余一律是上游原样；
-> 改动了哪些文件见 [FORK-NOTICE.md](FORK-NOTICE.md)。本文件的另一份在
-> [README.md](README.md)。
+**把 Python 的报错文案换成你自己写的。**
 
-**本仓库是叠加在 CPython 上的一组改动，不是一个 Python 发行版。** 关于 Python 本身的一切
-——它能跑在哪些平台、怎么安装、这个版本改了什么——都由上游记录，见
-[CPython 官方 README](https://github.com/python/cpython/blob/main/README.rst)。这份文件只讲
-本 fork 加了什么。
+> **这不是 Python 官方发行版。** 它是基于 CPython v3.15.0 的个人修改版，不受 Python
+> Software Foundation 支持或认可。除了报错文案可以替换这一件事，其余全部是上游原样。
+> 英文版见 [README.md](README.md)。
 
-## 这是什么
+它原本长这样：
 
-上游 CPython 的异常信息是写死在 C 源码里的字面量：`ZeroDivisionError: division by zero`
-是一个固定字符串。在这个 fork 里，这段文本可以来自外部查询表，所以你在 traceback 里看到
-的文案由你自己写。
+```console
+$ python -c "1/0"
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+    1/0
+    ~^~
+ZeroDivisionError: division by zero
+```
 
-交付物是一对东西：**能读表的解释器 + 表本身**（`lookup-table.txt`，随仓库分发）。这个思路
-来自 [kawaii-gcc](https://github.com/Bill-Haku/kawaii-gcc)——它把 GCC 的本地化文件换成改写过的
-`gcc.mo`；CPython 没有消息目录，所以同样的思路还需要在解释器里加一个钩子。
+装上 Kawaii-Python 之后长这样：
 
-只有异常信息受影响。构建系统、标准库、测试套件与许可证都是上游原样。
+```console
+$ python -c "1/0"
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+    1/0
+    ~^~
+ZeroDivisionError: 笨蛋才会把0放到除数吧！
+```
 
-## 用法
+文案写在仓库根目录的 `lookup-table.txt` 里，一行一条，想改哪条改哪条。这个思路来自
+[kawaii-gcc](https://github.com/Bill-Haku/kawaii-gcc)（把 GCC 的本地化文件换成改写过的
+`gcc.mo`），源头是中文项目 [gcc-hentai](https://github.com/Mosklia/gcc-hentai)。
 
-把 `PYTHON_MESSAGE_TABLE` 指向表，表里的消息就会被替换：
+## 下载与安装
+
+到 [Releases](https://github.com/Flotiarenor/Kawaii-Python/releases/latest) 下载对应平台的包：
+
+| 平台 | 产物 | 怎么装 |
+| --- | --- | --- |
+| Windows x64 | `Kawaii-Python-3.15.0-windows-x64.exe` | 双击安装，和装官方 Python 一样 |
+| Windows x64 | `Kawaii-Python-3.15.0-windows-x64.zip` | 解压即用的便携版，不用安装 |
+| Linux x64 | `Kawaii-Python-3.15.0-linux-x64.tar.gz` | 解压后运行其中的 `python3` |
+
+> [!NOTE]
+> 上表是发布产物的命名约定；**第一个 Release 发布前，这些包还不存在**，请按
+> [docs/development.md](docs/development.md) 从源码构建。
+
+Windows 安装包由 CPython 自带的 WiX 工程生成，行为和官方安装程序一致：默认装到当前用户的
+`%LocalAppData%\Programs\Python\Python315`，可以勾选加入 PATH，可以在「应用和功能」里卸载。
+它**与官方 Python 3.15 并存安装，不会覆盖你已经装好的 Python**。
+
+> 安装包没有代码签名，Windows 首次运行可能被 SmartScreen 拦下：点「更多信息」→「仍要运行」。
+
+装完之后让它生效，需要把表放到解释器能找到的位置（三选一）：
+
+- 把 `lookup-table.txt` 复制到解释器目录，即 `python -c "import sys; print(sys.prefix)"` 输出的那个目录；
+- 或者设环境变量 `PYTHON_MESSAGE_TABLE` 指向表的完整路径；
+- 或者在某个目录里放一份 `lookup-table.txt`，并在那个目录里启动 Python。
+
+```powershell
+# Windows：指向仓库根目录那份表，然后验证
+> set PYTHON_MESSAGE_TABLE=%CD%\lookup-table.txt
+> python -c "1/0"
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+    1/0
+    ~^~
+ZeroDivisionError: 笨蛋才会把0放到除数吧！
+```
 
 ```bash
+# Linux / macOS
 $ export PYTHON_MESSAGE_TABLE=./lookup-table.txt
 $ ./python -c "1/0"
 Traceback (most recent call last):
   File "<string>", line 1, in <module>
+    1/0
+    ~^~
 ZeroDivisionError: 笨蛋才会把0放到除数吧！
 ```
 
-Windows 上同理，表放在构建产物旁边：
+## 改成你自己想要的文案
 
-```powershell
-> set PYTHON_MESSAGE_TABLE=%CD%\lookup-table.txt
-> PCbuild\amd64\python.exe -c "1/0"
-```
-
-表的查找顺序（见 [Objects/message_table.c](Objects/message_table.c) 的 `message_table_path()`）：
-
-1. `$PYTHON_MESSAGE_TABLE`；
-2. `$PYTHONHOME/lookup-table.txt`；
-3. 当前工作目录下的 `lookup-table.txt`。
-
-注意这条顺序对「仓库根目录那份表」意味着什么：解释器**不会**主动去仓库根目录找它。所以要么
-设 `PYTHON_MESSAGE_TABLE`，要么在仓库根目录启动进程，要么把表复制到解释器旁边。要和解释器
-一起分发时，放到这个路径：
-
-```bash
-$ python -c "import sys; print(sys.prefix)"
-```
-
-## 表的格式
-
-纯 UTF-8 文本，一行一条，空行与 `#` 开头的行忽略。键与替换文本之间是**制表符**，不是逗号
-（这样键里才能自由出现逗号、空格、引号和括号）：
+打开仓库根目录的 `lookup-table.txt`，一行就是一条：
 
 ```
-原文<TAB>十六进制 UTF-8 的替换文本
+报错原文<TAB>十六进制写的替换文案
 ```
 
-键分两种。**不含 `*` 的是字面键**，要与消息逐字符相等才命中。**含 `*` 的是模式键**：每个 `*`
-代表任意长度的文本（可以为空），按出现顺序编号，替换文本用 `%1`、`%2` 引用对应捕获。字面键
-优先于模式键；多条模式命中时取 `*` 最少的那条。随仓库分发的表两种都用：
-
-```
-division by zero<TAB>e7aca8e8...
-'*' object has no attribute '*'<TAB>2725312720e5afb9...
-```
-
-右侧就是 `bytes.hex()` 的输出，生成自己的文本用：
+中间那个是**制表符**，不是逗号——因为报错原文里本来就可能出现逗号、空格、引号和括号。
+右侧的十六进制由文案的 UTF-8 字节得来，把想写的话交给下面这行命令就能得到：
 
 ```bash
 $ python -c "print(input().encode('utf-8').hex())"
 ```
 
-表在**第一次用到时读一次**并常驻内存，所以改完表要重开进程。表缺失或格式错误时按设计静默
-退回原文，和上游输出完全一致。整行写错也是同样的表现，所以某条看起来"没生效"时，先查路径、
-再查分隔符。
+改完保存，重开 Python 就生效（表在进程第一次用到时读一次）。把你改好的 `lookup-table.txt`
+提成 Pull Request，大家就都能用上你的文案——参与方式见文末。
 
-文件要像随仓库分发的那份一样保持**纯 ASCII**。这正是用十六进制的原因：编辑器若把它存成
-UTF-16、或存成带 BOM 的 UTF-8，前者会让每一行都失效，后者会把 BOM 悄悄塞进第一个键里。
+对表格的两点提醒：
 
-## 哪些异常能被替换
+- **`division by zero` 和 `list index out of range` 这两条是文档里的例子，请保持可用**；
+- 想只给自己用、不想公开的表，放到仓库外，用 `PYTHON_MESSAGE_TABLE` 指过去就行，不必动仓库里这份。
 
-判定分两步。第一步选要查的文本：类型用的是标准 `__str__` 时取 `args[0]`，否则取异常真实
-显示的文本——**这一步正是模式键能覆盖到"文本不是 `args[0]`"的类型的入口**。第二步，改写
-完成后让副本再显示一次，只有显示结果**恰好等于**新文本才保留改写；过不了这一步的改写会被
-丢弃，而不是打出来：
+## 表怎么写
+
+- 键：报错原文，**必须和运行时显示的文本逐字符相同**，大小写和标点都不能改。含 `*` 的是
+  **模式键**，用一条覆盖会变化的消息：
+  `'*' object has no attribute '*'` → `'%1' 对象没有属性 '%2'`，`%1`、`%2` 对应第一个、第二个 `*`。
+- 值：替换文案的十六进制 UTF-8，所以整份文件是纯 ASCII 的，任何编辑器打开、保存都不会弄坏它。
+- 空行和 `#` 开头的行会被忽略。
+
+## 哪些消息换不了
+
+有几种异常，你的条目会被查到，但**改写后反而会显示得更糟，所以程序保留原文**——这是设计，
+不是坏了：
 
 | 异常 | 结果 | 原因 |
 | --- | --- | --- |
-| `ZeroDivisionError`、`IndexError`、`TypeError`、`AttributeError`、`NameError`、`RecursionError`、`ImportError` 等 | 替换 | 显示文本就是 `args[0]` |
-| 继承标准 `__str__` 的子类 | 替换 | 同上 |
-| `SyntaxError` | 替换，位置保留 | 文本在 `.msg` 里，位置字段一并搬运 |
-| `KeyError` | 表里查到了，但保留原文 | 显示文本是 `repr(args[0])`，改写后会多出引号 |
-| 带 `errno` 的 `OSError` 及其子类 | 表里查到了，但保留原文 | 显示文本由 `errno`／`strerror`／`filename` 拼出 |
-| `UnicodeDecodeError` | 表里查到了，但保留原文 | 显示文本由 `encoding/object/start/end/reason` 拼出 |
-| 覆盖了 `__str__` 的子类 | 保留原文 | 显示文本是固定的 |
-| `Exception(1, 2)` 这类多参数异常 | 保留原文 | 显示的是参数元组的 repr |
+| `ZeroDivisionError`、`IndexError`、`TypeError`、`AttributeError`、`NameError` 等 | 替换 | 显示的就是报错原文 |
+| `SyntaxError` | 替换，行列位置保留 | 文案单独存放，位置字段一并搬运 |
+| `KeyError` | 保留原文 | 显示的是参数本身，改写后会多出一对引号 |
+| 带 `errno` 的 `OSError` / `FileNotFoundError` 等 | 保留原文 | 显示由错误号和文件名拼出，改写会丢掉它们 |
+| `UnicodeDecodeError` | 保留原文 | 显示由编码、位置等信息拼出 |
+| `Exception(1, 2)` 这类多参数异常 | 保留原文 | 显示的是参数本身 |
+| 自己写了 `__str__` 的异常子类 | 保留原文 | 显示文本是固定的 |
 
-「表里查到了，但保留原文」是设计结果而不是故障：这些类型写任何条目都不会生效。
+## 常见问题
 
-## 怎么构建
+**我改了表，为什么没生效？**
+按顺序查三件事：① 表的位置对不对（上面那三条路径）；② 分隔符是不是**制表符**，写成逗号
+这一行会被整行丢弃；③ 文件有没有被编辑器存成带 BOM 的 UTF-8——那会让第一行的键多出几个看不
+见的字符。改完表要**重开 Python**，表只在进程第一次用到时读一次。
 
-只有 Windows 构建与上游不同，差别在于**必须先编 `_freeze_module`**：
+**为什么有的条目明明在表里，显示出来还是英文？**
+见上一节：`KeyError`、带 `errno` 的 `OSError`、`UnicodeDecodeError` 和自定义 `__str__` 的类型
+属于"查到了但不改"。给它们写任何条目都不会生效。
 
-```powershell
-cd PCbuild
-.\get_externals.bat --no-tkinter
-msbuild _freeze_module.vcxproj /p:Configuration=Release /p:Platform=x64 /m
-msbuild python.vcxproj        /p:Configuration=Release /p:Platform=x64 /m
-```
+**它会替换掉我电脑上的 Python 吗？**
+不会。安装包与官方 Python 3.15 并存安装，装在自己的目录里，卸载也只删自己的文件。
 
-`pythoncore` 要 `Python/frozen_modules/*.h`，那些头文件只有该工程会生成、且不进版本控制，
-所以单独编 `python.vcxproj` 会在 `Modules/getpath.c` 上报
-`getpath.h: No such file or directory`。正常顺序靠解决方案级依赖保证，直接编工程就跳过了它。
+**能用在我 pip 里的那个 Python 上吗？**
+不能。替换逻辑在这个 fork 编译出的解释器里，官方 Python 没有这段代码，外部插件做不到。
 
-**不要**用 `msbuild pcbuild.sln /t:python`：`_tkinter` 挂在这个目标里，跳过 Tcl/Tk 会让它
-失败，连带整个目标失败，而 `python.vcxproj` 其实只需要 `pythoncore.vcxproj`。
+**Linux / macOS 有安装包吗？**
+暂时只有源码，构建步骤见 [docs/development.md](docs/development.md)。
 
-要跑测试套件还得补编扩展模块（`msbuild pcbuild.proj`，其中 `_tkinter` 会因为缺 Tcl/Tk 失败，
-那是预期的）。Unix / Linux / BSD / macOS 用：
+**我想临时看回英文原文，怎么办？**
+不设 `PYTHON_MESSAGE_TABLE`、也不在解释器目录放表，输出就和官方 Python 完全一样。
 
-```bash
-./configure
-make -j
-make test
-```
+## 开发者与更多文档
 
-Windows 上**不要用 `robocopy` 复制源码树**：CPython 带符号链接（`Misc/mypy/*`），`robocopy`
-会把链接当目录跟进去，直接卡死。用 `tar` 或 `git clone`。上游的构建文档照旧适用，这里不再
-抄一遍，见 [python/cpython:README.rst](https://github.com/python/cpython/blob/main/README.rst)。
+- [docs/development.md](docs/development.md)：从源码构建、生成安装包、查询表的格式与判定机制
+- [FORK-NOTICE.md](FORK-NOTICE.md)：与上游的差异清单、实现要点、构建与验收记录
+- [AGENTS.md](AGENTS.md)：本仓库的协作约定
 
-## 验证记录与实现细节
-
-构建矩阵、逐项验收结果、与上游的差异清单、以及哪些事不能做，都在
-[FORK-NOTICE.md](FORK-NOTICE.md)。
-
-## 参与
-
-本 fork 不受 Python 软件基金会与 CPython 核心团队支持。消息替换功能的问题提到本仓库；
-其他一切问题属于上游：https://github.com/python/cpython/issues
-
-本仓库使用的约定——语言政策、表的写法、改 C 代码前必须验证什么——写在
-[AGENTS.md](AGENTS.md) 与 [FORK-NOTICE.md](FORK-NOTICE.md)。
+本 fork 没有自己的问题跟踪。查询表与安装包的问题提到本仓库的
+[Issue](https://github.com/Flotiarenor/Kawaii-Python/issues)；Python 本身的 bug 属于
+[上游](https://github.com/python/cpython/issues)。
 
 ## 许可证
 
