@@ -5,7 +5,7 @@
     <String Id="ProductName">Python Launcher</String>
     <String Id="Title">Python Launcher</String>
     <String Id="Description">Python Launcher</String>
-    <String Id="Manufacturer">Python Software Foundation</String>
+      <String Id="Manufacturer">Kawaii-Python</String>
     <String Id="NoDowngrade">A newer version of the Python launcher is already installed.</String>
     <String Id="NoTargetDir">The TARGETDIR variable must be provided when invoking this installer.</String>
     <String Id="PythonFileDescription">Python File</String>

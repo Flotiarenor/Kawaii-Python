@@ -8,6 +8,13 @@
             <Component Id="NEWS.txt" Directory="InstallDirectory" Guid="*">
                 <File Name="NEWS.txt" KeyPath="yes" />
             </Component>
+            <!-- The deliverable of this fork: the replacement table.  It goes
+                 into the installation directory, which is one of the places the
+                 interpreter looks (sys.prefix), so an installed fork replaces
+                 messages without any environment variable. -->
+            <Component Id="lookup-table.txt" Directory="InstallDirectory" Guid="*">
+                <File Name="lookup-table.txt" Source="!(bindpath.src)lookup-table.txt" KeyPath="yes" />
+            </Component>
         </ComponentGroup>
     </Fragment>
 
