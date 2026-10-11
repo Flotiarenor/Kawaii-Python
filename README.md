@@ -43,7 +43,8 @@ Get the package for your platform from
 | --- | --- | --- |
 | Windows x64 | `Kawaii-Python-3.15.0-windows-x64.exe` | Double-click, same as installing official Python |
 | Windows x64 | `Kawaii-Python-3.15.0-windows-x64.zip` | Portable build, unzip and run |
-| Linux x64 | `Kawaii-Python-3.15.0-linux-x64.tar.gz` | Unpack and run the `python3` inside |
+| Linux x64 | `Kawaii-Python-3.15.0-linux-x64.tar.gz` | Unpack and run the `bin/python3` inside |
+| Linux x64 | `Kawaii-Python-3.15.0-linux-x64.zip` | Same, different compression |
 
 > [!NOTE]
 > The table above is the naming convention for release artifacts; **until the first release is
@@ -58,12 +59,17 @@ Python 3.15 and does not replace the Python you already have**.
 > The installer is not code-signed, so Windows SmartScreen may block the first run: click
 > "More info" → "Run anyway".
 
-To make it work, the table has to be somewhere the interpreter looks (any one of these):
+To make it work, the table has to be in one of the three places the interpreter looks, in this
+order of precedence:
 
-- copy `lookup-table.txt` into the interpreter directory, the one printed by
-  `python -c "import sys; print(sys.prefix)"`;
-- or set the environment variable `PYTHON_MESSAGE_TABLE` to the full path of the table;
-- or keep a `lookup-table.txt` in a directory and start Python from that directory.
+1. the file named by the `PYTHON_MESSAGE_TABLE` environment variable;
+2. `$PYTHONHOME/lookup-table.txt` (only reachable when you set `PYTHONHOME`);
+3. `lookup-table.txt` in **the directory you start Python from**.
+
+The easy route is to put `lookup-table.txt` in the directory you usually run Python from, or to set
+the environment variable. **Copying the table into the interpreter's own directory does not work**:
+`python -c "import sys; print(sys.prefix)"` prints `sys.prefix`, while the third location above is
+the current working directory — they are not the same thing.
 
 ```powershell
 # Windows: point at the table in the repository root and check
@@ -142,10 +148,12 @@ original, so the original is kept. This is by design, not a failure:
 ## FAQ
 
 **I edited the table and nothing changed.**
-Check three things in order: ① the table is in a place the interpreter looks (the three options
-above); ② the separator is a **tab** — a comma makes the whole line be dropped; ③ your editor did
-not save the file as UTF-8 with a BOM, which puts a few invisible characters in front of the first
-key. Then **restart Python**: the table is read once, on first use.
+Start with where the table is: the interpreter reads only a table in **the directory you started it
+from**, or the one named by `PYTHON_MESSAGE_TABLE` / `$PYTHONHOME`. Copying it into the
+interpreter's own directory does **not** work, and that is the easiest mistake to make. Then check
+two more things: ② the separator is a **tab** — a comma makes the whole line be dropped; ③ your
+editor did not save the file as UTF-8 with a BOM, which puts a few invisible characters in front of
+the first key. Finally **restart Python**: the table is read once, on first use.
 
 **Some entries are in the table but the message is still in English.**
 See the section above: `KeyError`, `OSError` with `errno`, `UnicodeDecodeError` and types with a
@@ -160,11 +168,12 @@ No. The replacement logic is compiled into this fork's interpreter; official Pyt
 that code, and no external add-on can reach it.
 
 **Is there an installer for Linux / macOS?**
-Source only for now; the build steps are in [docs/development.md](docs/development.md).
+There is a portable archive for Linux x64, in the table above. Nothing for macOS yet; the build
+steps are in [docs/development.md](docs/development.md).
 
 **The messages are cute now, but I want the original English back.**
-Leave `PYTHON_MESSAGE_TABLE` unset and keep no table in the interpreter directory; the output is
-then exactly upstream's.
+Leave `PYTHON_MESSAGE_TABLE` unset and keep no table in **the directory you start Python from**;
+the output is then exactly upstream's.
 
 ## Developers and further documentation
 

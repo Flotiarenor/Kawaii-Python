@@ -40,7 +40,8 @@ ZeroDivisionError: 笨蛋才会把0放到除数吧！
 | --- | --- | --- |
 | Windows x64 | `Kawaii-Python-3.15.0-windows-x64.exe` | 双击安装，和装官方 Python 一样 |
 | Windows x64 | `Kawaii-Python-3.15.0-windows-x64.zip` | 解压即用的便携版，不用安装 |
-| Linux x64 | `Kawaii-Python-3.15.0-linux-x64.tar.gz` | 解压后运行其中的 `python3` |
+| Linux x64 | `Kawaii-Python-3.15.0-linux-x64.tar.gz` | 解压后运行其中的 `bin/python3` |
+| Linux x64 | `Kawaii-Python-3.15.0-linux-x64.zip` | 同上，只是压缩格式不同 |
 
 > [!NOTE]
 > 上表是发布产物的命名约定；**第一个 Release 发布前，这些包还不存在**，请按
@@ -52,11 +53,15 @@ Windows 安装包由 CPython 自带的 WiX 工程生成，行为和官方安装�
 
 > 安装包没有代码签名，Windows 首次运行可能被 SmartScreen 拦下：点「更多信息」→「仍要运行」。
 
-装完之后让它生效，需要把表放到解释器能找到的位置（三选一）：
+装完之后让它生效，表要在解释器会去找的三个位置之一（按优先级）：
 
-- 把 `lookup-table.txt` 复制到解释器目录，即 `python -c "import sys; print(sys.prefix)"` 输出的那个目录；
-- 或者设环境变量 `PYTHON_MESSAGE_TABLE` 指向表的完整路径；
-- 或者在某个目录里放一份 `lookup-table.txt`，并在那个目录里启动 Python。
+1. 环境变量 `PYTHON_MESSAGE_TABLE` 指向的那个文件；
+2. `$PYTHONHOME/lookup-table.txt`（只在你设了 `PYTHONHOME` 时才有这一条）；
+3. **启动 Python 时所在目录**下的 `lookup-table.txt`。
+
+最省事的做法是把 `lookup-table.txt` 放进你平时启动 Python 的目录；否则就设环境变量。
+**注意：把表复制到解释器自己所在的目录并不会生效**——`python -c "import sys; print(sys.prefix)"`
+打印的是 `sys.prefix`，而上面第三条看的是当前工作目录，两者不是一回事。
 
 ```powershell
 # Windows：指向仓库根目录那份表，然后验证
@@ -129,9 +134,11 @@ $ python -c "print(input().encode('utf-8').hex())"
 ## 常见问题
 
 **我改了表，为什么没生效？**
-按顺序查三件事：① 表的位置对不对（上面那三条路径）；② 分隔符是不是**制表符**，写成逗号
-这一行会被整行丢弃；③ 文件有没有被编辑器存成带 BOM 的 UTF-8——那会让第一行的键多出几个看不
-见的字符。改完表要**重开 Python**，表只在进程第一次用到时读一次。
+先看表的位置：解释器只读**启动时所在目录**里的表，或 `PYTHON_MESSAGE_TABLE` /
+`$PYTHONHOME` 指向的表。把表复制到解释器自己所在的目录**不会**生效，这是最容易踩的一条。
+再看另外两件事：② 分隔符是不是**制表符**，写成逗号这一行会被整行丢弃；③ 文件有没有被编辑器
+存成带 BOM 的 UTF-8——那会让第一行的键多出几个看不见的字符。改完表要**重开 Python**，表只在
+进程第一次用到时读一次。
 
 **为什么有的条目明明在表里，显示出来还是英文？**
 见上一节：`KeyError`、带 `errno` 的 `OSError`、`UnicodeDecodeError` 和自定义 `__str__` 的类型
@@ -144,10 +151,12 @@ $ python -c "print(input().encode('utf-8').hex())"
 不能。替换逻辑在这个 fork 编译出的解释器里，官方 Python 没有这段代码，外部插件做不到。
 
 **Linux / macOS 有安装包吗？**
-暂时只有源码，构建步骤见 [docs/development.md](docs/development.md)。
+Linux x64 有便携压缩包，见上方的下载表格。macOS 暂无产物，构建步骤见
+[docs/development.md](docs/development.md)。
 
 **我想临时看回英文原文，怎么办？**
-不设 `PYTHON_MESSAGE_TABLE`、也不在解释器目录放表，输出就和官方 Python 完全一样。
+不设 `PYTHON_MESSAGE_TABLE`，并且不在**启动 Python 的目录**里放表，输出就和官方 Python 完全
+一样。
 
 ## 开发者与更多文档
 

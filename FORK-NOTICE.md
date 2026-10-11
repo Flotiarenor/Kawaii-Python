@@ -92,16 +92,19 @@ documented" job as a new public C API, which is why the hex decoder was made
 
 The table is looked up in this order:
 
-1. `$PYTHON_MESSAGE_TABLE`;
-2. `$PYTHONHOME/lookup-table.txt`;
-3. `lookup-table.txt` in the current directory.
+1. the file named by `$PYTHON_MESSAGE_TABLE`;
+2. `$PYTHONHOME/lookup-table.txt` — this reads the **environment variable** `PYTHONHOME`, not
+   `sys.prefix`, so on an ordinary installation this step never matches;
+3. `lookup-table.txt` in the current working directory (`message_table_open()` opens a relative
+   path with `fopen`).
 
-The table in the repository root is the deliverable, tracked and distributed
-with the source; the interpreter itself does not probe that path, so when you
-run a build from `PCbuild/amd64/` either set `$PYTHON_MESSAGE_TABLE` or start the
-process in the repository root.  The Windows installer does not place the table
-next to the interpreter either — copy it to `sys.prefix` or point
-`$PYTHON_MESSAGE_TABLE` at it.
+The table in the repository root is the deliverable, tracked and distributed with the source; the
+interpreter itself does not probe that path, so when you run a build from `PCbuild/amd64/` either
+set `$PYTHON_MESSAGE_TABLE` or start the process in the repository root.  **Copying the table into
+the interpreter's own directory does not work** — that directory is `sys.prefix`, which step 2 only
+consults if `PYTHONHOME` happens to point there.  The portable archives appear to pick the table up
+automatically because it sits in the directory they are extracted to, which is the working
+directory for anyone who starts the interpreter from there (step 3).
 
 Format: UTF-8, one entry per line, blank lines and lines starting with `#` are
 ignored, the key and the value are separated by a tab.  A key may contain

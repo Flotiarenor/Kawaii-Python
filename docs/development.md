@@ -67,27 +67,54 @@ cd Tools\msi
 
 - `--pack` 把全部 MSI 收进安装程序本体，得到一个不依赖旁边文件的单文件 `.exe`（
   `snapshot.wixproj` 的 `/p:Pack=true`）；
-- `--test-marker` 给注册表键与安装位置加一个标记，使其**与官方 Python 并存安装**，不会互相
-  覆盖（默认关闭，见 [Tools/msi/README.txt](../Tools/msi/README.txt) 的 `--test-marker` 一节）；
+- `--test-marker` 给注册表键与安装位置加一个标记（README 里 "an installer that works
+  side-by-side with an official Python release"），**fork 必须带上它**：本轮实测没有它时，
+  安装包在 Windows Installer 眼里就是官方 Python 3.15.0；带上之后，安装目录是
+  `%LocalAppData%\Programs\Python\Python315-test`、注册表是
+  `HKCU\Software\Python\PythonCore\3.15-test`，与官方 3.15 完全隔离；
 - 产物在 `PCbuild\amd64\en-us\`（[bundle.targets:17](../Tools/msi/bundle/bundle.targets#L17) 把
   `OutputPath` 追加了 `en-us\`）。
 
 脚本会同时编 Debug 与 Release 两套（安装包的 Debug 组件需要），所以首次运行耗时较长。
 
+### 构建前的两个前置条件
+
+这两条不在 `Tools\msi\README.txt` 的"一步"流程里，缺了会在很靠后的步骤才失败：
+
+1. **MSVC ARM64 生成工具**。[launcher.wixproj:38-43](../Tools/msi/launcher/launcher.wixproj#L38-L43)
+   会为 x86、x64、**ARM64** 各构建一次 `pyshellext.vcxproj`，且不看目标架构，所以即使只出
+   x64 安装包也必须有 ARM64 工具集，否则报 `MSB8020: 无法找到 v143 的生成工具`。缺它时用
+   VS 安装器补（需管理员）：
+   `VS Installer\setup.exe modify --installPath "<VS 路径>" --add Microsoft.VisualStudio.Component.VC.Tools.ARM64 --add Microsoft.VisualStudio.Component.VC.Tools.ARM64EC --quiet --norestart`。
+   **运行前先关掉所有 MSBuild/devenv 进程**，否则安装器以 `VSProcessesRunning`（退出码 8006）
+   拒绝执行。
+2. **HTML 文档与 `NEWS.txt`**。`doc` 包引用 `doc_html` 组件组，它由 Sphinx 的 HTML 输出经
+   `csv_to_wxs.py` 生成，所以要先 `cd Doc && .\make.bat html`（需要
+   `pip install -r Doc\requirements.txt`，注意该文件里的 `-c constraints.txt` 要求**在 `Doc\`
+   目录下执行 pip**）。`exe` 包则要 `NEWS.txt`：`Misc\NEWS` 不存在时它调用
+   `blurb merge`，而 **blurb 靠"首行匹配 `This is \w+ version \d+\.\d+` 的 `README` 或
+   `README.rst`"来定位仓库根**（`blurb/_cli.py` 的 `chdir_to_repo_root`）。本 fork 把
+   `README.rst` 换成了 `README.md`，这个标记就不存在了，于是 blurb 报
+   `You're not inside a CPython repo right now!`；构建期间临时放一个符合格式的 `README.rst`
+   即可（它未被跟踪，构建后删掉）。
+
 ### 产物命名
 
-默认名称由 [bundle.targets:9-15](../Tools/msi/bundle/bundle.targets#L9-L15) 拼出：非发布构建是
-`python-3.15.0.<天数>-amd64.exe`，其中天数自 2001-01-01 起算（
-[msi.props:72](../Tools/msi/msi.props#L72)）；`BuildForRelease=true` 时是 `python-3.15.0-amd64.exe`。
-仓库对外分发的名称是 `Kawaii-Python-3.15.0-windows-x64`，在构建时用属性覆盖：
+`snapshot.wixproj` 默认产出 `python-3.15.0.<天数>-amd64.exe`，天数自 2001-01-01 起算
+（[msi.props:72](../Tools/msi/msi.props#L72)）。换成 fork 的名字与唯一 `ReleaseUri`：
 
 ```powershell
 msbuild Tools\msi\bundle\releaselocal.wixproj /p:Platform=x64 /p:BuildForRelease=true `
-        /p:OutputName=Kawaii-Python /p:ReleaseUri=https://github.com/Flotiarenor/Kawaii-Python
+        /p:ReleaseUri=https://github.com/Flotiarenor/Kawaii-Python /p:UseTestMarker=true
 ```
 
+产出 `PCbuild\amd64\en-us\Kawaii-Python.exe`。**`/p:OutputName` 不会变成最终文件名**：bundle
+工程的属性会覆盖命令行传进去的值，最终名字取自工程自身；于是对外分发时把产物复制成
+`Kawaii-Python-3.15.0-windows-x64.exe`（本轮就是这么做的）。
+
 `releaselocal.wixproj` 是"内嵌默认安装所需文件"的发布用工程；`full.wixproj` 内嵌全部内容，
-适合本机测试；`snapshot.wixproj` 是 `build.bat` 用的测试工程。三者的区别见
+适合本机测试；`snapshot.wixproj` 是 `build.bat` 用的测试工程，其 bundle 名不会带上
+`-3.15.0` 后缀（因为 `snapshot.wixproj` 未设 `BuildForRelease`）。三者的区别见
 [Tools/msi/README.txt](../Tools/msi/README.txt)。
 
 ### fork 必须改的三处 URI
@@ -100,8 +127,11 @@ Windows Installer 眼里与官方 Python 3.15.0 是同一个产品，会去升�
 providing a unique URI for this property"（
 [Tools/msi/README.txt:159-165](../Tools/msi/README.txt#L159-L165)），
 [buildrelease.bat:4-6](../Tools/msi/buildrelease.bat#L4-L6) 的注释也要求 fork 复制该脚本再改。
+只做本地安装包、不发布时，用 `releaselocal.wixproj` 配合 `/p:ReleaseUri=` 即可（本轮采用这条），
+无需复制 `buildrelease.bat`；`ReleaseUri` 缺省时是 `$(ComputerName)/{arch}/`，那也会与官方
+冲突，所以本地构建同样要显式传。
 
-要改的三处，都集中在文件开头的 `set` 段：
+要改的三处，都集中在 `buildrelease.bat` 开头的 `set` 段：
 
 | 变量 | 官方默认值 | fork 该填什么 |
 | --- | --- | --- |
@@ -110,29 +140,34 @@ providing a unique URI for this property"（
 | `DOWNLOAD_URL` | `https://www.python.org/ftp/python/{version}/{arch}{releasename}/{msi}` | 同上 |
 
 `RELEASE_URI` 的 scheme **必须是 `http`**：改成 `https` 会让产物无法与官方版本互相升级
-（[buildrelease.bat:15-16](../Tools/msi/buildrelease.bat#L15-L16)）。只做本地安装包、不发布时，
-用 `releaselocal.wixproj` 配合 `/p:ReleaseUri=` 即可，无需复制 `buildrelease.bat`。
+（[buildrelease.bat:15-16](../Tools/msi/buildrelease.bat#L15-L16)）。
 
-安装程序的显示名（"Python 3.15.0" 之类）来自安装包自己的本地化字符串，在
-`Tools\msi\bundle\` 下的 `.wxl` 模板里，需要一并改成 Kawaii-Python。
+安装程序的显示名来自安装包自己的本地化字符串，在 `Tools\msi\bundle\` 下的 `.wxl` 模板里。
+**本 fork 尚未改这一处**：当前产物在"应用和功能"里显示为 `Python 3.15.0-test (64-bit)`，
+发布者仍是 `Python Software Foundation`（见下方"已知未做"）。
 
 ### 交付物里的表
 
-安装包只装 CPython 自己的文件，**不会自动带上 `lookup-table.txt`**。随包分发时把根目录那份表
-复制进 release 目录，或在 `Tools\msi\` 的打包流程里加一个复制步骤；表被找到的三个位置见下文。
+安装包只装 CPython 自己的文件，**不会自动带上 `lookup-table.txt`**——本轮构建的安装包，
+安装目录里没有这份表，所以装完仍是原样的 CPython，直到用户自己提供表。随包分发时把根目录
+那份表复制进 release 目录，或者在 `Tools\msi\` 的打包流程里加一个复制步骤。注意表放在安装
+目录里也**不会**自动生效（见下文的查找路径）；要让它开箱即用，得同时满足查找路径之一。
 
 ## 从源码运行与验证
 
 表怎么被找到（[Objects/message_table.c](../Objects/message_table.c) 的 `message_table_path()`），
 按优先级：
 
-1. `$PYTHON_MESSAGE_TABLE`；
-2. `$PYTHONHOME/lookup-table.txt`；
-3. 当前工作目录下的 `lookup-table.txt`。
+1. 环境变量 `$PYTHON_MESSAGE_TABLE` 指向的路径；
+2. `$PYTHONHOME/lookup-table.txt` —— 读的是**环境变量** `PYTHONHOME`，不是 `sys.prefix`；
+   引导期没有把 `PYTHONHOME` 指向前缀，所以普通安装下这一条不成立；
+3. 当前工作目录下的 `lookup-table.txt`（`message_table_open()` 用 `fopen` 打开相对路径）。
 
-仓库根目录那份表**不会**被 `PCbuild\amd64\python.exe` 自动读到：它不在 `$PYTHONHOME` 下，
-也不在构建产物的旁边。所以验证时要么设 `PYTHON_MESSAGE_TABLE`，要么把工作目录切到仓库根目录
-（第三条查找路径就是当前工作目录）。
+**这一点最容易写错**：把表复制到解释器所在的目录（`sys.prefix`）**不会**生效，除非
+`PYTHONHOME` 恰好被设为该目录。实测（Linux 安装树）：表在
+`/home/build/kawaii/kawaii-python-3.15.0/` 里、cwd 为 `/tmp` 时输出仍是
+`division by zero`；把表放到 cwd 里才变成替换文本。便携包之所以"开箱即用"，是因为表就在
+cwd（解压目录）里，走的是第三条路径。
 
 改动落到 C 代码后，四类情形都要实跑（表缺失或格式错误时按设计静默退回原文，所以"没替换"要
 先确认表路径，再怀疑代码）：
@@ -249,3 +284,20 @@ division by zero	e7aca8e89b8be6898de4bc9ae68a8a30e694bee588b0e999a4e695b0e590a7e
 [AGENTS.md](../AGENTS.md) 与 [.dsh/commit-conventions.md](../.dsh/commit-conventions.md)：
 C / Python 源码里的注释、docstring、命名一律英文，`Doc/**`、`Lib/**` 等上游文件不翻译，
 只有治理文档与本文件用中文。
+
+## 已知未做
+
+v3.15.0 的产物（Windows 安装包与便携 zip、Linux 便携包）已构建并逐项验收，以下几条是明确的
+未完成项，不是遗漏：
+
+- **安装包的产品名与发布者仍是官方的**：在"应用和功能"里显示为
+  `Python 3.15.0-test (64-bit)`、发布者 `Python Software Foundation`。要改成 Kawaii-Python
+  得改 `Tools\msi\bundle\` 下的 `.wxl` 本地化模板，那会让与上游的差异文件从 8 个变成 9 个
+  （见 [FORK-NOTICE.md](../FORK-NOTICE.md) 的差异清单），需要先确认这个代价可以接受。
+- **便携包不含 tkinter 之外的 Tcl/Tk 运行时资源校验**：Linux 包里的 `_tkinter` 已编入，
+  但容器内的 Tcl/Tk 视发行版而定；Windows 包的 `tcl/` 目录由 `PC/layout` 放入，未单独验证
+  图形界面启动。
+- **Linux 包的体积还能再降**：当前 41 MiB（`tar.gz` 15 MB），已经去掉静态库、测试套件与
+  字节码缓存；若需要更小，可考虑 `--without-ensurepip` 或按需裁剪 `idlelib`。
+- **`buildrelease.bat` 的 fork 副本尚未落地**：本轮用 `releaselocal.wixproj` 配合
+  `/p:ReleaseUri=` 完成，所以仓库里还没有一条可复现的发布脚本，只有本文记录的命令。

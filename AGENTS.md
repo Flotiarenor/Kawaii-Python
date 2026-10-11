@@ -139,8 +139,11 @@
    静默退回原文，所以"没替换"要先确认表路径，再怀疑代码。**表怎么找到**（
    [Objects/message_table.c](Objects/message_table.c) 的 `message_table_path()`）：
    `$PYTHON_MESSAGE_TABLE` 优先，其次是 `$PYTHONHOME/lookup-table.txt`，最后才是当前工作目录的
-   `lookup-table.txt` —— 仓库根目录那份表不会自动被 `PCbuild\amd64\python.exe` 读到，验证时要么
-   设 `PYTHON_MESSAGE_TABLE`，要么在仓库根目录执行。上游的补充检查是
+   `lookup-table.txt`。注意第二条读的是**环境变量** `PYTHONHOME`，不是 `sys.prefix`：把表复制到
+   解释器所在目录**不会**生效（v3.15.0 实测，Linux 安装树：表在 prefix 里、cwd 在 /tmp 时仍输出
+   `division by zero`）。所以验证时要么设 `PYTHON_MESSAGE_TABLE`，要么在仓库根目录执行——仓库
+   根目录那份表不会被 `PCbuild\amd64\python.exe` 自动读到，除非 cwd 就在那里。便携包"开箱即用"
+   是因为表在解压目录里，而用户从那里启动，走的正是第三条。上游的补充检查是
    `.\python.bat Tools\patchcheck\patchcheck.py` 与 `.\python.bat -m test`。改动表内容时，
    `division by zero` 与 `list index out of range` 这两条要保持可用（README 与
    [FORK-NOTICE.md](FORK-NOTICE.md) 的示例以它们为依据；注意 `[][0]` 不是键，`IndexError` 的键是
@@ -258,9 +261,9 @@ fix(message-table): 修正 REPL 下不替换异常信息的情形
 - [Include/message_table.h](Include/message_table.h) 第 4 行的注释写着"见 `attach.patch`"，这个
   文件在仓库里不存在，指向它的句子应当改掉。改这句话要动 C 头文件，按上面第 1 步必须真实
   构建一次，不要只为文案顺手改。
-- [docs/development.md](docs/development.md) 里的 `Tools\msi\build.bat -x64 --pack --test-marker`
-  与 `releaselocal.wixproj` 的 `/p:OutputName`、`/p:ReleaseUri` 组合**尚未实跑过**，是按
-  [Tools/msi/README.txt](Tools/msi/README.txt) 与工程文件写出的流程；首次真实打包后要把产物名、
-  实际路径与命令回填该节，跑不通的地方一并改掉。
+- [docs/development.md](docs/development.md) 的安装包一节已按 v3.15.0 的真实构建回填（MSVC ARM64
+  工具集与 VSProcessesRunning 8006、临时的 `README.rst` 标记、`doc` 包依赖 Sphinx 输出、
+  `/p:OutputName` 不决定最终文件名）。仍未落地的是 `buildrelease.bat` 的 fork 副本，以及
+  安装包产品名/发布者仍是官方那两处，见该文件末尾的"已知未做"。
 - 上游文件自带的 CJK 只出现在 `Lib/test/**` 的测试数据与 `Doc/**` 的示例里，属于既定内容，
   不要顺手"清理"。
