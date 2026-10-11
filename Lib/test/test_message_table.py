@@ -20,8 +20,8 @@ import sys
 import tempfile
 import unittest
 
-from test.support import os_helper
-from test.support.script_helper import assert_python_failure, assert_python_ok
+from test.support import os_helper, requires_subprocess
+from test.support.script_helper import assert_python_failure
 
 
 def entry(key, value):
@@ -29,6 +29,7 @@ def entry(key, value):
     return f"{key}\t{value.encode('utf-8').hex()}"
 
 
+@requires_subprocess()
 class MessageTableTests(unittest.TestCase):
 
     def setUp(self):
@@ -41,9 +42,15 @@ class MessageTableTests(unittest.TestCase):
             fh.write("\n".join(lines) + "\n")
         return path
 
+    def child_env(self, table):
+        # CI sets FORCE_COLOR (.github/workflows/build.yml), which colorizes the
+        # tracebacks below and would break every assertion on their text;
+        # PYTHON_COLORS takes precedence over it.
+        return dict(os.environ, PYTHON_MESSAGE_TABLE=table, PYTHON_COLORS="0")
+
     def run_script(self, table, code):
         """Run -c code with the table; returns (rc, stdout, stderr)."""
-        env = dict(os.environ, PYTHON_MESSAGE_TABLE=table)
+        env = self.child_env(table)
         proc = subprocess.run([sys.executable, "-c", code],
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                               env=env)
@@ -52,7 +59,7 @@ class MessageTableTests(unittest.TestCase):
 
     def run_repl(self, table, source):
         """Feed stdin to the interactive interpreter; returns its output."""
-        env = dict(os.environ, PYTHON_MESSAGE_TABLE=table)
+        env = self.child_env(table)
         proc = subprocess.run([sys.executable, "-i", "-q"],
                               input=source.encode(), stdout=subprocess.PIPE,
                               stderr=subprocess.STDOUT, env=env)
@@ -82,7 +89,7 @@ class MessageTableTests(unittest.TestCase):
     def test_table_missing_is_not_fatal(self):
         missing = os.path.join(self.dir, "does-not-exist.txt")
         _, _, err = assert_python_failure(
-            "-c", "1/0", PYTHON_MESSAGE_TABLE=missing)
+            "-c", "1/0", PYTHON_MESSAGE_TABLE=missing, PYTHON_COLORS="0")
         self.assertIn(b"ZeroDivisionError: division by zero", err)
 
     def test_gate_rejects_a_key_that_would_break_the_display(self):
