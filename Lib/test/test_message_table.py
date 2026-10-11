@@ -32,7 +32,6 @@ import sys
 import tempfile
 import textwrap
 import unittest
-import weakref
 
 from test.support import os_helper, requires_subprocess
 
