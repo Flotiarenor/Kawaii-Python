@@ -93,21 +93,25 @@ documented" job as a new public C API, which is why the hex decoder was made
 
 ## Using it
 
-The table is looked up in this order:
+The table is looked up in this order, taking the first candidate that opens:
 
 1. the file named by `$PYTHON_MESSAGE_TABLE`;
-2. `$PYTHONHOME/lookup-table.txt` — this reads the **environment variable** `PYTHONHOME`, not
-   `sys.prefix`, so on an ordinary installation this step never matches;
-3. `lookup-table.txt` in the current working directory (`message_table_open()` opens a relative
+2. `$PYTHONHOME/lookup-table.txt`;
+3. `lookup-table.txt` in `sys.prefix` (the installation directory, next to the interpreter);
+4. `lookup-table.txt` in the current working directory (`message_table_open()` opens a relative
    path with `fopen`).
 
-The table in the repository root is the deliverable, tracked and distributed with the source; the
-interpreter itself does not probe that path, so when you run a build from `PCbuild/amd64/` either
-set `$PYTHON_MESSAGE_TABLE` or start the process in the repository root.  **Copying the table into
-the interpreter's own directory does not work** — that directory is `sys.prefix`, which step 2 only
-consults if `PYTHONHOME` happens to point there.  The portable archives appear to pick the table up
-automatically because it sits in the directory they are extracted to, which is the working
-directory for anyone who starts the interpreter from there (step 3).
+A candidate that cannot be read does not stop the walk, and a lookup that found nothing is not
+remembered, so a table that appears later is picked up.  Step 3 is what makes the installer
+self-contained: the table it ships sits next to `python.exe`, so an installed fork replaces messages
+without any environment variable.  A source checkout is deliberately excluded from step 3 — it has
+the deliverable at its root, and treating that as an installed table would rewrite the messages of
+the test suite that runs from the checkout (the marker is the one `sysconfig.is_python_build()` uses,
+`<prefix>/Modules/Setup`).  `-E` skips the two environment candidates, `-I` skips the current
+directory, and `-X message-table=off` switches the feature off for a run.
+
+The portable archives pick the table up through steps 3 and 4, since it sits in the directory they
+are extracted to.
 
 Format: UTF-8, one entry per line, blank lines and lines starting with `#` are
 ignored, the key and the value are separated by a tab.  A key may contain

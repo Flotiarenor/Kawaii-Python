@@ -54,17 +54,18 @@ Python 3.15 and does not replace the Python you already have**.
 > The installer is not code-signed, so Windows SmartScreen may block the first run: click
 > "More info" → "Run anyway".
 
-To make it work, the table has to be in one of the three places the interpreter looks, in this
-order of precedence:
+The installer puts the table where the interpreter looks, so an installed fork works **out of the
+box**.  To use a table of your own, put it in one of these places — the first candidate that opens
+wins:
 
 1. the file named by the `PYTHON_MESSAGE_TABLE` environment variable;
 2. `$PYTHONHOME/lookup-table.txt` (only reachable when you set `PYTHONHOME`);
-3. `lookup-table.txt` in **the directory you start Python from**.
+3. `lookup-table.txt` in `sys.prefix` — the installation directory, next to `python.exe`;
+4. `lookup-table.txt` in **the directory you start Python from**.
 
-The easy route is to put `lookup-table.txt` in the directory you usually run Python from, or to set
-the environment variable. **Copying the table into the interpreter's own directory does not work**:
-`python -c "import sys; print(sys.prefix)"` prints `sys.prefix`, while the third location above is
-the current working directory — they are not the same thing.
+A candidate that cannot be read does not stop the walk, and a failed lookup is not remembered, so a
+table that appears later takes effect.  `-X message-table=off` switches the feature off for a run,
+`-E` skips the two environment candidates and `-I` skips the current directory.
 
 ```powershell
 # Windows: point at the table in the repository root and check
@@ -146,12 +147,14 @@ still keep the original — replacing the whole line would lose information. Eve
 ## FAQ
 
 **I edited the table and nothing changed.**
-Start with where the table is: the interpreter reads only a table in **the directory you started it
-from**, or the one named by `PYTHON_MESSAGE_TABLE` / `$PYTHONHOME`. Copying it into the
-interpreter's own directory does **not** work, and that is the easiest mistake to make. Then check
-two more things: ② the separator is a **tab** — a comma makes the whole line be dropped; ③ your
-editor did not save the file as UTF-8 with a BOM, which puts a few invisible characters in front of
-the first key. Finally **restart Python**: the table is read once, on first use.
+Start with where the table is: the interpreter tries `PYTHON_MESSAGE_TABLE`, then
+`$PYTHONHOME/lookup-table.txt`, then the table in the installation directory, then one in **the
+directory you started it from**, and takes the first that opens. Then check three more things:
+② the separator is a **tab** — a comma makes the whole line be dropped; ③ your editor did not save
+the file as UTF-8 with a BOM, which puts a few invisible characters in front of the first key;
+④ no line is longer than 16384 bytes and none holds a NUL byte, because such a line is skipped as a
+whole. Finally **restart Python**: the table is read once, on first use; run with `-X dev` to have
+the skipped lines reported.
 
 **Some entries are in the table but the message is still in English.**
 First check that the key matches the text shown at run time character for character: one space or one

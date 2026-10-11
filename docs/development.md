@@ -161,24 +161,22 @@ PSF 版权声明照旧保留。安装界面里的帮助链接（`docs.python.org
 
 ### 交付物里的表
 
-安装包只装 CPython 自己的文件，**不会自动带上 `lookup-table.txt`**——本轮构建的安装包，
-安装目录里没有这份表，所以装完仍是原样的 CPython，直到用户自己提供表。随包分发时把根目录
-那份表复制进 release 目录，或者在 `Tools\msi\` 的打包流程里加一个复制步骤。注意表放在安装
-目录里也**不会**自动生效（见下文的查找路径）；要让它开箱即用，得同时满足查找路径之一。
+安装包**自带** `lookup-table.txt`：`Tools\msi\exe\exe_files.wxs` 的 `exe_txt` 组件组把它装进
+安装目录，而安装目录就是新的查找路径里的第三条（`sys.prefix`），所以装完开箱即用。便携 zip
+由 `local\pack_win.py` 把根目录那份表放进解压目录，走第三条与第四条。源码树里第三条被跳过
+（见下），所以在仓库根跑构建时要靠 cwd 或环境变量。
 
 ## 从源码运行与验证
 
-表怎么被找到（[Objects/message_table.c](../Objects/message_table.c) 的 `message_table_path()`），
-按优先级：
+表怎么被找到（[Objects/message_table.c](../Objects/message_table.c) 的
+`message_table_candidate()`）：按 `$PYTHON_MESSAGE_TABLE` → `$PYTHONHOME/lookup-table.txt` →
+`<sys.prefix>/lookup-table.txt` → 当前工作目录的顺序，**取第一个能打开的**；某个候选读不到
+不会中断查找，失败也不被记住。`-E` 跳过两个环境候选，`-I` 跳过当前目录，
+`-X message-table=off` 整体关闭。
 
-1. 环境变量 `$PYTHON_MESSAGE_TABLE` 指向的路径；
-2. `$PYTHONHOME/lookup-table.txt` —— 读的是**环境变量** `PYTHONHOME`，不是 `sys.prefix`；
-   引导期没有把 `PYTHONHOME` 指向前缀，所以普通安装下这一条不成立；
-3. 当前工作目录下的 `lookup-table.txt`（`message_table_open()` 用 `fopen` 打开相对路径）。
-
-**这一点最容易写错**：把表复制到解释器所在的目录（`sys.prefix`）**不会**生效，除非
-`PYTHONHOME` 恰好被设为该目录。实测（Linux 安装树）：表在
-`/home/build/kawaii/kawaii-python-3.15.0/` 里、cwd 为 `/tmp` 时输出仍是
+**源码树里会跳过 `sys.prefix` 这一条**：仓库根既是前缀又放着交付物本身的那份表，判定方式与
+`sysconfig.is_python_build()` 相同（`<prefix>/Modules/Setup` 存在），否则测试套件会被自己的表
+改写。实测（Linux 安装树）：表在 `/home/build/kawaii/kawaii-python-3.15.0/` 里、cwd 为 `/tmp` 时输出仍是
 `division by zero`；把表放到 cwd 里才变成替换文本。便携包之所以"开箱即用"，是因为表就在
 cwd（解压目录）里，走的是第三条路径。
 

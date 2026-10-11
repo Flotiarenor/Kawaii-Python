@@ -141,13 +141,13 @@
 
    十六进制那一侧用 `print(input().encode('utf-8').hex())` 生成；表缺失或格式错误时按设计
    静默退回原文，所以"没替换"要先确认表路径，再怀疑代码。**表怎么找到**（
-   [Objects/message_table.c](Objects/message_table.c) 的 `message_table_path()`）：
-   `$PYTHON_MESSAGE_TABLE` 优先，其次是 `$PYTHONHOME/lookup-table.txt`，最后才是当前工作目录的
-   `lookup-table.txt`。注意第二条读的是**环境变量** `PYTHONHOME`，不是 `sys.prefix`：把表复制到
-   解释器所在目录**不会**生效（v3.15.0 实测，Linux 安装树：表在 prefix 里、cwd 在 /tmp 时仍输出
-   `division by zero`）。所以验证时要么设 `PYTHON_MESSAGE_TABLE`，要么在仓库根目录执行——仓库
-   根目录那份表不会被 `PCbuild\amd64\python.exe` 自动读到，除非 cwd 就在那里。便携包"开箱即用"
-   是因为表在解压目录里，而用户从那里启动，走的正是第三条。上游的补充检查是
+   [Objects/message_table.c](Objects/message_table.c) 的 `message_table_candidate()`）：
+   `$PYTHON_MESSAGE_TABLE` → `$PYTHONHOME/lookup-table.txt` → `<sys.prefix>/lookup-table.txt` →
+   当前工作目录的 `lookup-table.txt`，**取第一个能打开的**（某个候选读不到会继续往下试，失败
+   不被记住；表后来出现就生效）。第三条就是安装包自带的表：装完开箱即用，便携包解压后也一样。
+   源码树里会跳过第三条——仓库根既含 `lookup-table.txt` 又含 `Modules/Setup`，判定方式与
+   `sysconfig.is_python_build()` 相同，否则测试套件会被自己的表改写。两个环境候选在 `-E` 下跳过、
+   当前目录在 `-I` 下跳过，`-X message-table=off` 整体关闭。上游的补充检查是
    `.\python.bat Tools\patchcheck\patchcheck.py` 与 `.\python.bat -m test`。改动表内容时，
    `division by zero` 与 `list index out of range` 这两条要保持可用（README 与
    [FORK-NOTICE.md](FORK-NOTICE.md) 的示例以它们为依据；注意 `[][0]` 不是键，`IndexError` 的键是
@@ -155,9 +155,13 @@
    **验收要看"副本显示成什么"**：改写只在副本的显示恰好等于新文本时才生效。过不了这道闸门的
    类型——`KeyError`、带 errno 的 `OSError`、`UnicodeDecodeError`、自定义 `__str__` 的子类——
    改走**显示代理**：副本是原子类的一层子类，`__str__` 直接返回新文本，异常名与 `isinstance`
-   不变；代理建不出来（例如基类的 `__init_subclass__` 会抛）时才保留原文。`SyntaxError` 仍走
-   "以新文本开头即放行"的分支（它会在文案后面追加 `(<file>, line N)`），代理刻意跳过它；**多参数
+   不变；代理建不出来（例如基类的 `__init_subclass__` 会抛）时才保留原文。自定义 `__str__` 的
+   类型**不做等值比较**（有状态的 `__str__` 能通过检查再打印出第三种文本），一律走代理；
+   `SyntaxError` 走"以新文本开头即放行"的分支（它会在文案后面追加 `(<file>, line N)`）；**多参数
    SyntaxError 根本走不到那一步**，见下方的已知缺陷。
+   **表是外部输入**：行长上限 16384 字节（超长整行跳过并计数）、含 NUL 的行判畸形、值按严格
+   UTF-8 解码、文件不得超过 16 MiB 且必须是常规文件、条目上限 65536、模式回溯用"每次查找一份"
+   的预算。畸形行只在 `-X dev` 下打一行诊断，正常运行时静默跳过。
 4. `git status` 确认没把构建产物与日志带进提交。
 
 ## 提交信息规范
@@ -272,9 +276,8 @@ fix(message-table): 修正 REPL 下不替换异常信息的情形
   见 [FORK-NOTICE.md](FORK-NOTICE.md) 的 "Known defect" 与
   [docs/development.md](docs/development.md) 的"已知缺陷"。改这条路径前先读那两节，别照着
   README 里"SyntaxError 能替换"的旧说法做验证。
-- [Include/message_table.h](Include/message_table.h) 第 4 行的注释写着"见 `attach.patch`"，这个
-  文件在仓库里不存在，指向它的句子应当改掉。改这句话要动 C 头文件，按上面第 1 步必须真实
-  构建一次，不要只为文案顺手改。
+- [Include/message_table.h](Include/message_table.h) 原来那句"见 `attach.patch`"已改成直接说明
+  头文件为什么挂在 `Include/cpython/unicodeobject.h` 上，同时补了"返回 NULL 时不留异常"的契约。
 - [docs/development.md](docs/development.md) 的安装包一节已按 v3.15.0 的真实构建回填（MSVC ARM64
   工具集与 VSProcessesRunning 8006、临时的 `README.rst` 标记、`doc` 包依赖 Sphinx 输出）。
   两条已纠正：`/p:OutputName` **确实**决定 bundle 的最终名字（命令行全局属性优先于工程里的
