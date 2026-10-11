@@ -181,3 +181,7 @@ Python/frozen_modules/MANIFEST
 # People's custom https://docs.anthropic.com/en/docs/claude-code/memory configs.
 /.claude/
 CLAUDE.local.md
+
+# This fork's scratch space: message audits, measurements, exported lists.
+# Local working data only, never part of the distribution; see AGENTS.md.
+/local/

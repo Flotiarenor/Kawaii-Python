@@ -7,7 +7,7 @@ Python Software Foundation.
 | | |
 | --- | --- |
 | Baseline | [CPython v3.15.0](https://github.com/python/cpython/releases/tag/v3.15.0) |
-| This repository | https://github.com/Flotiarenor/Python |
+| This repository | https://github.com/Flotiarenor/Kawaii-Python |
 | Official CPython | https://github.com/python/cpython |
 | Official downloads / docs | https://www.python.org/ · https://docs.python.org |
 | License | PSF License Version 2, unchanged ([LICENSE](LICENSE)) |
@@ -15,21 +15,38 @@ Python Software Foundation.
 Everything except the one feature below is upstream and unmodified: the build
 system, the standard library, the test suite, and the license.
 
+The design follows [kawaii-gcc](https://github.com/Bill-Haku/kawaii-gcc), which
+replaces GCC's localization file with a Japanese `gcc.mo` (the idea started with
+the Chinese project [gcc-hentai](https://github.com/Mosklia/gcc-hentai)).  CPython
+has no message catalogue, so the same idea needs a hook in the interpreter and a
+lookup table; that table ships with this repository and is part of what you
+install.
+
 ## The feature
 
-Exception messages can be replaced through an external text table.  The table
-is a plain text file, one entry per line, `original message,hex-encoded UTF-8
-replacement`:
+Exception messages can be replaced through an external text table.  The table is
+a plain text file, one entry per line, `original message<TAB>hex-encoded UTF-8
+replacement`; the separator is a tab, and the replacement text is Chinese with
+full-width punctuation:
 
 ```
-division by zero,e7aca8e89b8be6898de4bc9ae68a8a30e694bee588b0e999a4e695b0e590a721
+division by zero<TAB>e7aca8e89b8be6898de4bc9ae68a8a30e694bee588b0e999a4e695b0e590a721
+```
+
+A key containing `*` is a pattern instead of literal text: it matches the message
+the exception displays, every `*` captures a run of characters (non-greedy,
+numbered in order), and the replacement refers to the captures as `%1`, `%2`.
+One pattern therefore covers every value the interpreter can put into a message:
+
+```
+'*' object has no attribute '*'<TAB>2725312720e5afb9e8b1a1e6b2a1e69c89e5b19ee680a72027253227
 ```
 
 ```console
 $ PYTHON_MESSAGE_TABLE=./lookup-table.txt ./python -c "1/0"
 Traceback (most recent call last):
   File "<string>", line 1, in <module>
-ZeroDivisionError: 笨蛋才会把0放到除数吧!
+ZeroDivisionError: 笨蛋才会把0放到除数吧！
 ```
 
 The interactive REPL is covered too, which is the reason this needs a C hook:
@@ -38,7 +55,7 @@ implementation cannot reach that case.
 
 ## Where it differs from upstream
 
-Three files touched, two added:
+Six upstream files touched, two added:
 
 | File | Change |
 | --- | --- |
@@ -66,8 +83,20 @@ The table is looked up in this order:
 2. `$PYTHONHOME/lookup-table.txt`;
 3. `lookup-table.txt` in the current directory.
 
+The table in the repository root is the deliverable, tracked and distributed
+with the source; the interpreter itself does not probe that path, so when you
+run a build from `PCbuild/amd64/` either set `$PYTHON_MESSAGE_TABLE` or start the
+process in the repository root.  Copy the table next to the installed
+interpreter, or point `$PYTHON_MESSAGE_TABLE` at it, to ship the two together.
+
 Format: UTF-8, one entry per line, blank lines and lines starting with `#` are
-ignored.  Generate the hex side with:
+ignored, the key and the value are separated by a tab.  A key may contain
+commas, spaces, quotes and brackets — everything except a tab or a line break,
+because a key has to equal the message text exactly — so the two sides are
+separated by the one character a message never contains.  A key containing `*`
+is a pattern (see [The feature](#the-feature)); a literal key always wins over a
+pattern, and among patterns the one with the fewest `*` wins.  Generate the hex
+side with:
 
 ```python
 print(input().encode('utf-8').hex())
@@ -75,27 +104,39 @@ print(input().encode('utf-8').hex())
 
 The table is read once, on first use, and stays in memory.  A missing or
 malformed table degrades silently — the original message is always printed.
+Line-level mistakes fail the same way, so when an entry seems to do nothing,
+check the path first and the separator second.
 
 ## What it cannot do
 
-`BaseException.__str__` derives the displayed text from `args[0]`, but some
-types build it from dedicated fields, and rewriting `args` there would change
-nothing.  Those instances are detected and skipped:
+Whether a message can be replaced is decided in two steps.  First the text to
+look up is chosen: if the type uses the standard `__str__` (compared by `tp_str`,
+no allocation) the message is `args[0]`; otherwise it is whatever the exception
+displays.  A pattern key can therefore reach types whose display is not
+`args[0]` at all.  Second, once a replacement is built, the copy is asked for its
+display again: the rewrite is kept only if that display is exactly the new text
+(`SyntaxError` is the one exception, it may continue with the location it
+renders).  Without that second step the copy would print something nobody asked
+for — a `KeyError` would show `repr()` of the new text, an `OSError` carrying
+`errno` would show a tuple, and a `UnicodeDecodeError` copy would show nothing at
+all.
 
-| Exception | Replaceable | Why |
+| Exception | What happens | Why |
 | --- | --- | --- |
-| `ZeroDivisionError`, `IndexError`, `TypeError`, `AttributeError`, `NameError`, `RecursionError`, `ImportError`, … | yes | the display is `args[0]` |
-| subclasses that inherit the standard `__str__` | yes | same |
-| `SyntaxError` | yes | text lives in `.msg`, location in `args[1]`; both are updated |
-| `KeyError` | no | the display adds quotes |
-| `OSError` / `FileNotFoundError`, … | no | the display gains an `[Errno 2] ` prefix from `errno` |
-| `UnicodeDecodeError` | no | text is built from `encoding/object/start/end/reason` |
-| subclasses that override `__str__` | no | the display is fixed text |
+| `ZeroDivisionError`, `IndexError`, `TypeError`, `AttributeError`, `NameError`, `RecursionError`, `ImportError`, … | replaced | the display is `args[0]` |
+| subclasses that inherit the standard `__str__` | replaced | same |
+| `SyntaxError` | replaced, location kept | text lives in `.msg`; `filename`, `lineno`, `offset`, `text` and the end positions are copied over, so the display is `new text (file, line N)` |
+| `KeyError` | found in the table, then left alone | the display is `repr(args[0])`: the rewrite would print `'<new text>'` |
+| `OSError` / `FileNotFoundError`, … with `errno` | found in the table, then left alone | the display is built from `errno`/`strerror`/`filename`; the copy would print a tuple and lose all three |
+| `UnicodeDecodeError` | found in the table, then left alone | the display is built from `encoding/object/start/end/reason`, and a copy made with `__new__` has no `object` member, so it displays an empty string |
+| `Exception(1, 2)` and other multi-argument exceptions | found in the table, then left alone | the display is the tuple repr |
+| subclasses that override `__str__` | never matched, nothing to do | the display is fixed text that does not mention `args` |
 
-The decision is made per instance, in two steps: if the type uses the standard
-`__str__` (compared by `tp_str`, no allocation) the message is taken straight
-from `args[0]`; otherwise the real display is compared, and a message that the
-display is not derived from is left alone.
+"Found in the table, then left alone" is the intended outcome: the entry is
+reachable, and the rewrite is discarded because it would print something worse
+than the original.  `Objects/exceptions.c:3867` (empty `UnicodeDecodeError`
+copy) and `:2927` (where `SyntaxError` renders its location) are the upstream
+lines behind the two most surprising rows.
 
 ## Building
 
@@ -104,12 +145,21 @@ Windows:
 ```powershell
 cd PCbuild
 .\get_externals.bat --no-tkinter
-msbuild python.vcxproj /p:Configuration=Release /p:Platform=x64 /m
+msbuild _freeze_module.vcxproj /p:Configuration=Release /p:Platform=x64 /m
+msbuild python.vcxproj        /p:Configuration=Release /p:Platform=x64 /m
 ```
 
 Do not use `msbuild pcbuild.sln /t:python`: `_tkinter` sits inside the `python`
 target, and skipping Tcl/Tk makes it fail, which fails the whole target even
 though `python.vcxproj` only needs `pythoncore.vcxproj`.
+
+Build `_freeze_module` first.  `pythoncore` includes
+`Python/frozen_modules/*.h`, which that project generates, and only a
+solution-level dependency orders them — building `python.vcxproj` alone fails
+with `getpath.h: No such file or directory` on a tree where the generated headers
+are absent (they are not tracked; see `.gitignore`).  A full `pcbuild.proj` build
+additionally needs `_socket` and the other extension projects for the test
+runner; `_tkinter` will still fail without Tcl/Tk, which is expected.
 
 Unix, Linux, BSD, macOS:
 
@@ -128,38 +178,91 @@ at [python/cpython:README.rst](https://github.com/python/cpython/blob/v3.15.0/RE
 
 ## Verified
 
-Built and tested on Windows x64 Release (VS2022, MSC 19.44) against
-v3.15.0 — details in [patches/3.15/VERIFIED.txt](patches/3.15/VERIFIED.txt):
+Built and tested on Windows x64 Release (VS2022, MSC 19.44) against v3.15.0;
+the checks and what each one showed:
 
 | Case | Result |
 | --- | --- |
 | no table configured | `ZeroDivisionError: division by zero` (unchanged) |
-| `python -c "1/0"` | `ZeroDivisionError: 笨蛋才会把0放到除数吧!` |
-| `python -c "[][0]"` | `IndexError: list后面的地方,不...不可以再看了,会坏掉的,呜` |
+| `python -c "1/0"` | `ZeroDivisionError: 笨蛋才会把0放到除数吧！` |
+| `python -c "[][0]"` | `IndexError: list后面的地方，不……不可以再看了，会坏掉的，呜` |
 | interactive `>>> 1/0` | replaced |
 | `SyntaxError(..., (file, line, offset, text))` in the REPL | replaced, location kept |
 | message not in the table | unchanged |
-| `open('/nope')` | `FileNotFoundError: [Errno 2] ...` (correctly skipped) |
-| custom `__str__`, `OSError` subclass, `KeyError` | correctly skipped |
+| `open('/nope')` | `FileNotFoundError: [Errno 2] ...` (pattern matched, rewrite discarded) |
+| custom `__str__`, `OSError` subclass, `KeyError` | matched where a pattern covers them, rewrite discarded |
+
+Every row above has since been re-checked on a Release x64 build of the current
+tree (`MSC v.1944`, 3.15.0, `heads/main:a2a6516`), together with the wildcard
+pattern engine, the display gate and the tab separator:
+
+| Case | Result |
+| --- | --- |
+| `python -c "1/0"` | `ZeroDivisionError: 笨蛋才会把0放到除数吧！` (literal key) |
+| `python -c "(1).foo"` | `AttributeError: 'int' 对象没有属性 'foo'` (pattern key, captures `int` and `foo`) |
+| `python -c "[][0]"` | `IndexError: list后面的地方，不……不可以再看了，会坏掉的，呜` |
+| `>>> 1/0` and `>>> (1).foo` in the REPL | both replaced — the interactive loop never calls `sys.excepthook` |
+| `raise ValueError('not in table')` | unchanged |
+| `open('nope-xyz')` | `FileNotFoundError: [Errno 2] ...` (pattern matched, rewrite discarded by the gate) |
+| `{}['missing']` | `KeyError: 'missing'` (same gate) |
+| `PYTHON_MESSAGE_TABLE` pointing at a missing file | `division by zero`, unchanged |
+| `compile('1 +', ...)` | message replaced where the table covers it, location kept either way |
+
+`Lib/test/test_message_table.py` encodes this as 10 cases and runs under
+`python -m test test_message_table`; `test_exceptions`, `test_traceback`,
+`test_sys` and `test_capi.test_exceptions` (684 tests) pass unchanged.
+
+The whole suite was run once on that build (`-m test -j8`, 8 min 38 s, 50 017
+tests, 547 of 558 files).  11 files failed, 15 assertions in total, and none of
+them come from the message table:
+
+- `test_asyncio.test_events`, `test_proactor_events`, `test_sendfile`,
+  `test_socket`, `test_urllib`, `test_urllib2`, `test_urllib2_localnet` —
+  loopback sockets; the log is full of `[WinError 10048]`, the address being in
+  use, which is this machine's port and firewall situation;
+- `test_embed` — wants an installed layout (`_testembed.exe`, a real
+  `pybuilddir.txt`), not a `PCbuild/amd64` tree;
+- `test_sysconfig.test_symlink` and `test_platform.test_architecture_via_symlink`
+  — want the `win-amd64` symlink directory a full build creates in `PCbuild`;
+- `test_venv.test_venvwlauncher` — `pythonw.exe` is not built by
+  `python.vcxproj`.
+
+Two checks support that reading: renaming `lookup-table.txt` away, which leaves
+the replacement feature dormant, reproduced **exactly the same 11 files and 15
+assertions**; and grepping the 72 163-line log for the table's own wording
+(`笨蛋`, `喵～`, `长点心`, `人家`, `杂鱼`, `离谱`) finds nothing — the only CJK in
+it are Windows' own localized `OSError` strings.
+
+Building it also turned up a step the upstream instructions do not mention for a
+tree whose generated files are absent: `pythoncore` needs
+`Python/frozen_modules/*.h`, which are produced by the `_freeze_module` project,
+and a **solution**-level dependency is what normally orders the two.  Building
+`python.vcxproj` on its own skips it, so build `_freeze_module.vcxproj` first:
+
+```powershell
+msbuild _freeze_module.vcxproj /p:Configuration=Release /p:Platform=x64
+msbuild python.vcxproj        /p:Configuration=Release /p:Platform=x64
+```
 
 ## Upgrading to a newer CPython
 
-Do not merge this tree with upstream.  The feature is small, so the portable
-route is to re-apply it on a fresh baseline; the ready-made patches live in
-[patches/](patches/):
+Do not merge this tree with upstream: the fork and upstream share no common
+commit history.  The feature is small, so the portable route is to re-apply it
+on a fresh baseline:
 
 ```bash
 git fetch upstream --tags
 git switch -c 3.16 v3.16.0
-cp patches/3.15/message_table.c  Objects/message_table.c
-cp patches/3.15/message_table.h  Include/message_table.h
-git apply -p1 --3way patches/3.15/attach.patch
-git apply -p1 --3way patches/3.15/build-integration.patch
+git diff --name-only v3.15.0 cc632c6   # cc632c6: the v3.15.0 import, feature included
 ```
 
-When `_PyErr_Display` or the surrounding lines change upstream, the patch may
-need a hand: it is one insertion at the top of that function plus one call in
-`_Py_Finalize`, and the implementation file itself needs no changes.
+The differences to re-apply are the rows of the table under
+[Where it differs from upstream](#where-it-differs-from-upstream): copy
+`Objects/message_table.c` and `Include/message_table.h`, re-add the `#include`
+at the end of `Include/cpython/unicodeobject.h`, re-add the three build-system
+entries, and re-add the two call sites — one insertion at the top of
+`_PyErr_Display`, one call in `_Py_Finalize`.  The implementation file itself
+needs no changes.
 
 ## License
 
