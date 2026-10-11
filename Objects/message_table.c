@@ -10,7 +10,9 @@
  *      and UnicodeDecodeError build the message from dedicated fields and
  *      KeyError applies repr().  Those instances are now matched on the text
  *      they actually display, which is the reason the table understands
- *      patterns at all.
+ *      patterns at all.  Writing the replacement into args[0] cannot reach
+ *      such a display, so it is carried by a subclass whose __str__ returns
+ *      it instead: see the display proxy section below.
  *
  * Everything is plain C on public API: nothing here imports Python code, so a
  * traceback stays printable no matter how broken the interpreter's import
@@ -1310,11 +1312,15 @@ message_table_get(void)
     return message_table;
 }
 
+/* Defined next to the display proxy, further down. */
+static void display_proxies_clear(void);
+
 /* Called from _Py_Finalize() (see attach.patch). */
 void
 _PyMessageTable_Fini(void)
 {
     message_table_clear();
+    display_proxies_clear();
     message_table_failed = 0;
 }
 
@@ -1370,19 +1376,18 @@ replaceable_message(PyObject *exc)
 }
 
 /*
- * A shallow copy of `exc`: same type, same args, same instance dict, and the
- * same traceback, cause and context (those live in C-level slots, not in
- * __dict__).  The copy is what carries the replacement, so the exception the
- * user still holds is never touched.
+ * A shallow copy of `exc`, created as an instance of `type`: same args, same
+ * instance dict, and the same traceback, cause and context (those live in
+ * C-level slots, not in __dict__).  The copy is what carries the replacement,
+ * so the exception the user still holds is never touched.  `type` is normally
+ * Py_TYPE(exc); the display proxy below passes a subclass of it instead.
  *
  * Returns a new reference, or NULL.
  */
 static PyObject *
-copy_exception(PyObject *exc)
+copy_exception_as(PyObject *exc, PyObject *type)
 {
-    PyTypeObject *type = Py_TYPE(exc);
-    PyObject *copy = PyObject_CallMethod((PyObject *)type, "__new__", "O",
-                                        (PyObject *)type);
+    PyObject *copy = PyObject_CallMethod(type, "__new__", "O", type);
     if (copy == NULL) {
         PyErr_Clear();
         return NULL;
@@ -1457,6 +1462,13 @@ copy_exception(PyObject *exc)
     }
 
     return copy;
+}
+
+/* A copy of the same type as `exc`; see copy_exception_as(). */
+static PyObject *
+copy_exception(PyObject *exc)
+{
+    return copy_exception_as(exc, (PyObject *)Py_TYPE(exc));
 }
 
 /*
@@ -1559,6 +1571,222 @@ copy_shows_replacement(PyObject *value, PyObject *copy, PyObject *replacement)
     return ok;
 }
 
+/* ------------------------------------------------------------------ */
+/* display proxy                                                       */
+/* ------------------------------------------------------------------ */
+
+/*
+ * A few types build their displayed text from C-level members instead of
+ * args[0], so a replacement written there never reaches the display:
+ *
+ *     FileNotFoundError: [Errno 2] No such file or directory: 'no-such-file'
+ *     UnicodeDecodeError: 'utf-8' codec can't decode byte 0xff ...
+ *     KeyError: 'no-such-key'
+ *
+ * For those the replacement is carried by a display proxy: a copy whose type
+ * is a subclass of the original one, with a __str__ that returns the
+ * replacement.  A subclass, rather than a plain exception, keeps the printed
+ * name ("FileNotFoundError: ..." comes from __qualname__ and __module__ in
+ * traceback, from tp_name in the C fallback) and keeps isinstance() checks
+ * working on the object that is displayed.
+ *
+ * The subclass is created once per base type and cached, because the same
+ * type shows up in every traceback.
+ */
+#define MESSAGE_TABLE_DISPLAY_ATTR "_PyMessageTable_display"
+
+/*
+ * Upper bound on the cached proxy classes.  One proxy is needed per exception
+ * type that is displayed, and a program is free to build exception classes at
+ * run time (a factory that calls type(), a plugin system), so the cache gets a
+ * ceiling: past it a proxy is still built and used, it is just not kept.
+ */
+#define MESSAGE_PROXY_MAX_CACHED 64
+
+typedef struct {
+    PyObject *base;             /* the type the proxy stands in for */
+    PyObject *proxy;            /* its subclass, holding __str__ */
+} DisplayProxy;
+
+static DisplayProxy *display_proxies = NULL;
+static Py_ssize_t display_proxy_count = 0;
+static Py_ssize_t display_proxy_capacity = 0;
+
+/*
+ * __str__ of a display proxy: the replacement the copy carries, or the empty
+ * string when the attribute is missing.  It never falls back to str(self),
+ * which would call this function again.
+ */
+static PyObject *
+display_proxy_str(PyObject *self, PyObject *ignored)
+{
+    (void)ignored;
+    PyObject *text = PyObject_GetAttrString(self, MESSAGE_TABLE_DISPLAY_ATTR);
+    if (text == NULL) {
+        PyErr_Clear();
+        text = PyUnicode_FromString("");
+    }
+    return text;
+}
+
+/* Handed to PyDescr_NewMethod() below; the entry has to outlive the class. */
+static PyMethodDef display_proxy_str_method = {
+    "__str__", display_proxy_str, METH_NOARGS, NULL,
+};
+
+static void
+display_proxies_clear(void)
+{
+    for (Py_ssize_t i = 0; i < display_proxy_count; i++) {
+        Py_DECREF(display_proxies[i].base);
+        Py_DECREF(display_proxies[i].proxy);
+    }
+    PyMem_Free(display_proxies);
+    display_proxies = NULL;
+    display_proxy_count = 0;
+    display_proxy_capacity = 0;
+}
+
+/*
+ * The proxy class for `base`, or NULL with an exception set.
+ *
+ * The name, the qualified name and the module are copies of the base's, so
+ * that the line traceback prints for a proxy is the line it would print for
+ * the original exception.  Failing to create the class only costs the
+ * rewrite: the caller keeps the original message.
+ */
+static PyObject *
+display_proxy_class(PyObject *base)
+{
+    for (Py_ssize_t i = 0; i < display_proxy_count; i++) {
+        if (display_proxies[i].base == base) {
+            return Py_NewRef(display_proxies[i].proxy);
+        }
+    }
+
+    PyObject *name = PyObject_GetAttrString(base, "__name__");
+    PyObject *qualname = PyObject_GetAttrString(base, "__qualname__");
+    PyObject *module = PyObject_GetAttrString(base, "__module__");
+    PyObject *bases = PyTuple_Pack(1, base);
+    PyObject *namespace = PyDict_New();
+    PyObject *method = NULL;
+    PyObject *proxy = NULL;
+
+    if (name == NULL || qualname == NULL || module == NULL || bases == NULL
+        || namespace == NULL) {
+        goto done;
+    }
+    if (PyDict_SetItemString(namespace, "__qualname__", qualname) < 0
+        || PyDict_SetItemString(namespace, "__module__", module) < 0) {
+        goto done;
+    }
+    /* The descriptor belongs to the base, not to the subclass: binding it
+       only asks that the instance be an instance of that base, which every
+       proxy instance is. */
+    method = PyDescr_NewMethod((PyTypeObject *)base,
+                               &display_proxy_str_method);
+    if (method == NULL
+        || PyDict_SetItemString(namespace, "__str__", method) < 0) {
+        goto done;
+    }
+    proxy = PyObject_CallFunction((PyObject *)&PyType_Type, "OOO",
+                                  name, bases, namespace);
+    if (proxy == NULL) {
+        goto done;
+    }
+
+    /* Cache it.  Running out of memory, or reaching the ceiling, is not worth
+       failing over: the proxy is usable as it is, it just will not be reused. */
+    if (display_proxy_count < MESSAGE_PROXY_MAX_CACHED) {
+        if (display_proxy_count == display_proxy_capacity) {
+            Py_ssize_t capacity = display_proxy_capacity == 0
+                ? 8 : display_proxy_capacity * 2;
+            if (capacity > MESSAGE_PROXY_MAX_CACHED) {
+                capacity = MESSAGE_PROXY_MAX_CACHED;
+            }
+            DisplayProxy *bigger = PyMem_Realloc(
+                display_proxies, (size_t)capacity * sizeof(DisplayProxy));
+            if (bigger == NULL) {
+                PyErr_Clear();
+            }
+            else {
+                display_proxies = bigger;
+                display_proxy_capacity = capacity;
+            }
+        }
+        if (display_proxy_count < display_proxy_capacity) {
+            display_proxies[display_proxy_count].base = Py_NewRef(base);
+            display_proxies[display_proxy_count].proxy = Py_NewRef(proxy);
+            display_proxy_count++;
+        }
+    }
+
+done:
+    Py_XDECREF(name);
+    Py_XDECREF(qualname);
+    Py_XDECREF(module);
+    Py_XDECREF(bases);
+    Py_XDECREF(namespace);
+    Py_XDECREF(method);
+    return proxy;
+}
+
+/*
+ * Is the text the table matched the whole text `value` displays?
+ *
+ * When tp_str is BaseException's, the lookup is done on args[0], while the
+ * display is the repr of the whole args tuple as soon as there is more than
+ * one argument.  Replacing the display with the table's text would then drop
+ * the arguments the key never covered, so those instances are left alone.
+ * Every other type displays exactly the text the lookup ran on.
+ */
+static int
+message_is_whole_display(PyObject *value)
+{
+    if (Py_TYPE(value)->tp_str != Py_TYPE(PyExc_BaseException)->tp_str) {
+        return 1;
+    }
+    PyObject *args = PyException_GetArgs(value);
+    if (args == NULL) {
+        PyErr_Clear();
+        return 0;
+    }
+    int whole = PyTuple_Check(args) && PyTuple_GET_SIZE(args) <= 1;
+    Py_DECREF(args);
+    return whole;
+}
+
+/*
+ * A copy of `value` that displays `replacement` whatever its own __str__ would
+ * say.  Returns a new reference, or NULL when no proxy can be built or the
+ * copy would not display the replacement.
+ */
+static PyObject *
+exception_with_display(PyObject *value, PyObject *replacement)
+{
+    PyObject *proxy_type = display_proxy_class((PyObject *)Py_TYPE(value));
+    if (proxy_type == NULL) {
+        PyErr_Clear();
+        return NULL;
+    }
+    PyObject *copy = copy_exception_as(value, proxy_type);
+    Py_DECREF(proxy_type);
+    if (copy == NULL) {
+        return NULL;
+    }
+    if (PyObject_SetAttrString(copy, MESSAGE_TABLE_DISPLAY_ATTR,
+                               replacement) < 0) {
+        PyErr_Clear();
+        Py_DECREF(copy);
+        return NULL;
+    }
+    if (!copy_shows_replacement(value, copy, replacement)) {
+        Py_DECREF(copy);
+        return NULL;
+    }
+    return copy;
+}
+
 /*
  * Show `replacement` instead of the message `value` carries.
  *
@@ -1612,10 +1840,17 @@ exception_with_message(PyObject *value, PyObject *replacement)
     }
 
     if (!copy_shows_replacement(value, copy, replacement)) {
-        /* The copy would show something other than the replacement, so this
-           type does not display what the table rewrote: keep the original. */
+        /* This type does not render args[0] (OSError, UnicodeDecodeError,
+           KeyError, a type with its own __str__), so the copy built above
+           shows something else: a display proxy carries the replacement
+           instead.  SyntaxError is left out even there, because its own path
+           above keeps the location that a proxy would drop. */
         Py_DECREF(copy);
-        return NULL;
+        if (PyObject_TypeCheck(value, (PyTypeObject *)PyExc_SyntaxError)
+            || !message_is_whole_display(value)) {
+            return NULL;
+        }
+        return exception_with_display(value, replacement);
     }
 
     return copy;

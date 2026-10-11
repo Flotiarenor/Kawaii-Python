@@ -54,8 +54,8 @@ Traceback (most recent call last):
 ZeroDivisionError: 笨蛋才会把0放到除数吧！
 ```
 
-The table that ships here currently holds 4814 literal keys and 20 patterns
-(`lookup-table.txt` is 4917 lines, 83 of them blank or comments), and every entry
+The table that ships here currently holds 4814 literal keys and 21 patterns
+(`lookup-table.txt` is 4918 lines, 83 of them blank or comments), and every entry
 quoted in this file or in the READMEs decodes to exactly the text shown there —
 including `'int' object has no attribute 'foo'`, which is not a key but the
 pattern above rendered with `int` and `foo` substituted into `%1` and `%2`.
@@ -130,7 +130,7 @@ check the path first and the separator second.
 
 ## What it cannot do
 
-Whether a message can be replaced is decided in two steps.  First the text to
+Whether a message can be replaced is decided in three steps.  First the text to
 look up is chosen: if the type uses the standard `__str__` (compared by `tp_str`,
 no allocation) the message is `args[0]`; otherwise it is whatever the exception
 displays.  A pattern key can therefore reach types whose display is not
@@ -140,24 +140,30 @@ display again: the rewrite is kept only if that display is exactly the new text
 renders).  Without that second step the copy would print something nobody asked
 for — a `KeyError` would show `repr()` of the new text, an `OSError` carrying
 `errno` would show a tuple, and a `UnicodeDecodeError` copy would show nothing at
-all.
+all.  Third, for exactly those types, the text is carried by a **display proxy**:
+a copy whose type is a subclass of the exception's own type whose `__str__`
+returns the replacement.  A subclass rather than a fresh exception class keeps
+the printed name (`__qualname__` and `__module__` for `traceback`, `tp_name` for
+the C fallback) and every `isinstance()` check on the object that is displayed.
+The subclass is created once per base type and cached, and it is built from
+public C API only (`type()`, `PyDescr_NewMethod()`), with no import.
 
 | Exception | What happens | Why |
 | --- | --- | --- |
 | `ZeroDivisionError`, `IndexError`, `TypeError`, `AttributeError`, `NameError`, `RecursionError`, `ImportError`, … | replaced | the display is `args[0]` |
 | subclasses that inherit the standard `__str__` | replaced | same |
-| `SyntaxError` **with a single argument** | replaced | the display is `args[0]`; the multi-argument form the compiler produces (`compile()`, `exec()`, an imported file) is **not** replaced — see "Known defect" below |
-| `KeyError` | found in the table, then left alone | the display is `repr(args[0])`: the rewrite would print `'<new text>'` |
-| `OSError` / `FileNotFoundError`, … with `errno` | found in the table, then left alone | the display is built from `errno`/`strerror`/`filename`; the copy would print a tuple and lose all three |
-| `UnicodeDecodeError` | found in the table, then left alone | the display is built from `encoding/object/start/end/reason`, and a copy made with `__new__` has no `object` member, so it displays an empty string |
-| `Exception(1, 2)` and other multi-argument exceptions | found in the table, then left alone | the display is the tuple repr |
-| subclasses that override `__str__` | never matched, nothing to do | the display is fixed text that does not mention `args` |
+| `SyntaxError` **with a single argument** | replaced | the display is `args[0]`; the multi-argument form the compiler produces (`compile()`, `exec()`, an imported file) is **not** replaced — see "Known defect" below, the proxy is skipped there on purpose |
+| `KeyError` | replaced through a display proxy | the display is `repr(args[0])`, which rewriting `args` cannot change |
+| `OSError` / `FileNotFoundError`, … with `errno` | replaced through a display proxy | the display is built from `errno`/`strerror`/`filename`, none of which an `args` rewrite reaches |
+| `UnicodeDecodeError` (and the other `UnicodeError` shapes with their own `__str__`) | replaced through a display proxy | the display is built from `encoding`/`object`/`start`/`end`/`reason`, and a copy made with `__new__` has no `object` member, so it displays an empty string |
+| subclasses that override `__str__` | replaced through a display proxy | the display is fixed text that does not mention `args` |
+| `Exception(1, 2)`, `ValueError('a', 'b')` and other multi-argument exceptions | found in the table, then left alone | the lookup saw `args[0]` (or the `str()` of the tuple when that is not a string), while the display is the repr of the whole tuple: replacing it would drop the arguments the key never covered |
 
 "Found in the table, then left alone" is the intended outcome: the entry is
 reachable, and the rewrite is discarded because it would print something worse
 than the original.  `Objects/exceptions.c:3867` (empty `UnicodeDecodeError`
 copy) and `:2927` (where `SyntaxError` renders its location) are the upstream
-lines behind the two most surprising rows.
+lines behind the two shapes that still keep their text.
 
 ## Known defect: multi-argument SyntaxError is never replaced
 
@@ -193,12 +199,19 @@ single-argument form has no location to lose, so the earlier claim that a
 rewrite keeps file and line was describing a case that cannot occur — the
 README now states which shape is covered.
 
+The display proxy that carries replacements for the other types deliberately
+skips `SyntaxError`: its `__str__` also renders the file, the line and the
+caret, so a proxy would print the bare replacement and drop all three.  The
+multi-argument shape therefore still keeps its original text, location
+included.
+
 ## Verified
 
 Built and tested on Windows x64 Release (VS2022, MSC 19.44) against v3.15.0.
 Every row below was re-checked on a Release x64 build of the current tree
 (`MSC v.1944`, 3.15.0, `heads/main:a2a6516`), together with the wildcard pattern
-engine, the display gate and the tab separator:
+engine, the display gate and the tab separator; the rows that go through the
+display proxy were re-checked on the build that added it.
 
 | Case | Result |
 | --- | --- |
@@ -207,17 +220,30 @@ engine, the display gate and the tab separator:
 | `python -c "[][0]"` | `IndexError: list后面的地方，不……不可以再看了，会坏掉的，呜` |
 | `python -c "(1).foo"` | `AttributeError: 'int' 对象没有属性 'foo'` (pattern key, captures `int` and `foo`) |
 | interactive `>>> 1/0` and `>>> (1).foo` | both replaced — the interactive loop never calls `sys.excepthook` |
-| `SyntaxError(..., (file, line, offset, text))` in the REPL | replaced, location kept |
-| `compile('1 +', ...)` | message replaced where the table covers it, location kept either way |
+| `raise SyntaxError('msg')`, script or REPL | replaced (the single-argument shape) |
+| `compile('1 +', '<demo>', 'exec')`, REPL `1 +` | `SyntaxError: invalid syntax` — the known defect above, the proxy is skipped there |
 | `raise ValueError('not in table')` | unchanged |
-| `open('nope-xyz')` | `FileNotFoundError: [Errno 2] ...` (pattern matched, rewrite discarded by the gate) |
-| `{}['missing']` | `KeyError: 'missing'` (same gate) |
-| custom `__str__`, `OSError` subclass, `KeyError` | matched where a pattern covers them, rewrite discarded |
+| `raise ValueError('a', 'b')` with a key for `a` | `ValueError: ('a', 'b')` — the display is the tuple, not the matched text |
+| `open('no-such-file-xyz')`, key `[Errno *] *: '*'` | `FileNotFoundError: [错误码 2] No such file or directory: 'no-such-file-xyz'` |
+| `open('other-file')`, same pattern key | `FileNotFoundError: [错误码 2] No such file or directory: 'other-file'` — the captures come from the display |
+| `class MyMissing(FileNotFoundError)` raised | `MyMissing: [错误码 2] ...` — the proxy is built from the raised type, not from `OSError` |
+| `b'\xff'.decode('utf-8')`, shipped key `'*' codec can't decode byte * in position *: *` | `UnicodeDecodeError: 'utf-8' 解码器无法解码第 0 位的字节 0xff: invalid start byte` — captures `utf-8`, `0xff` and `0`, the reason stays as it came |
+| `b'\x81'.decode('gbk')`, same shipped key | `UnicodeDecodeError: 'gbk' 解码器无法解码第 0 位的字节 0x81: incomplete multibyte sequence` |
+| `{}['missing']`, key `'missing'` (quotes included) | `KeyError: 换掉了` — no quotes are added |
+| subclass with its own `__str__`, key `weird message` | `Weird: 很奇怪的消息` |
+| the same four proxy cases through `sys.__excepthook__(type(e), e, e.__traceback__)` | identical text — every entry point reaches the hook |
+| a type whose `__init_subclass__` raises | original message kept, no error — building the proxy failed and was abandoned |
 | `PYTHON_MESSAGE_TABLE` pointing at a missing file | `division by zero`, unchanged |
 
-`Lib/test/test_message_table.py` encodes these as 10 cases and runs under
-`python -m test test_message_table`; `test_exceptions`, `test_traceback`,
-`test_sys` and `test_capi.test_exceptions` (684 tests) pass unchanged.
+`Lib/test/test_message_table.py` encodes these as 14 cases and runs under
+`python -m test test_message_table`; on this build `test_message_table`,
+`test_exceptions`, `test_traceback`, `test_codecs` and `test_os` all pass
+(1 420 tests run in total).  The proxy rows above come from the build that added
+it: Release x64, 0 warnings and 0 errors.  The `OSError` and `UnicodeDecodeError`
+rows ran with the shipped `lookup-table.txt` (its `[Errno *] *: '*'` and
+`'*' codec can't decode byte * in position *: *` entries), the `KeyError` and
+custom-`__str__` rows with a two-line table, because the shipped one has no key
+for those two texts.
 
 The whole suite was run once on that build (`-m test -j8`, 8 min 38 s, 50 017
 tests, 547 of 558 files).  11 files failed, 15 assertions in total, and none of

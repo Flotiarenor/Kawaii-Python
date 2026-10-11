@@ -127,18 +127,21 @@ Two things to remember about the table:
 
 ## What cannot be replaced
 
-For a few exceptions an entry you write has no effect: the original is kept, because a rewrite would
-display something worse. This is by design, not a failure:
+`KeyError`, `OSError` / `FileNotFoundError` with `errno`, `UnicodeDecodeError` and subclasses with
+their own `__str__` are replaced now: none of them build their display from `args[0]`, so the copy is
+made a subclass of the exception's own type whose `__str__` returns your text. The exception name
+and any `isinstance` check stay the same.
+
+The multi-argument `SyntaxError` the compiler produces, and multi-argument exceptions in general,
+still keep the original — replacing the whole line would lose information. Every shape:
 
 | Exception | Result | Why |
 | --- | --- | --- |
 | `ZeroDivisionError`, `IndexError`, `TypeError`, `AttributeError`, `NameError`, … | replaced | the display is the original message |
+| `KeyError`, `OSError` / `FileNotFoundError` with `errno`, `UnicodeDecodeError`, subclasses with their own `__str__` | replaced | the display is not `args[0]`; it goes through the display proxy described above |
 | `SyntaxError` **with a single argument** (e.g. `raise SyntaxError('msg')`) | replaced | the display is the original message |
-| `KeyError` | original kept | the display is `repr(args[0])`, and a rewrite would add a pair of quotes |
-| `OSError` / `FileNotFoundError`, … with `errno` | a pattern key covers it, but the original is kept | the display is built from the error number and the file name, which a rewrite would drop |
-| `UnicodeDecodeError` | original kept | the display is built from the encoding and positions |
-| `Exception(1, 2)` and other multi-argument exceptions | original kept | the display is the tuple repr |
-| exception subclasses with their own `__str__` | original kept | the display text is fixed |
+| the `SyntaxError` the compiler produces (`compile()`, `exec()`, an imported file, REPL input) | original kept | known defect, see [FORK-NOTICE.md](FORK-NOTICE.md) |
+| `Exception(1, 2)`, `ValueError('a', 'b')` and other multi-argument exceptions | original kept | the table looked up `args[0]`, while the display is the repr of the whole tuple |
 
 ## FAQ
 
@@ -151,8 +154,11 @@ editor did not save the file as UTF-8 with a BOM, which puts a few invisible cha
 the first key. Finally **restart Python**: the table is read once, on first use.
 
 **Some entries are in the table but the message is still in English.**
-See the section above: `KeyError`, `OSError` with `errno`, `UnicodeDecodeError` and types with a
-custom `__str__` never adopt a rewrite. Writing an entry for them has no effect.
+First check that the key matches the text shown at run time character for character: one space or one
+half-width punctuation mark off and the line becomes a dead key, silently. Two keys are easy to get
+wrong: `KeyError` is keyed by the repr (`'missing'`, quotes included) and `OSError` by the whole line
+(`[Errno 2] No such file or directory: 'x'`). If the exception is a multi-argument one, or a
+`SyntaxError` the compiler produced, it is one of the two shapes listed in the section above.
 
 **Will it replace the Python on my machine?**
 No. The installer puts it in its own directory alongside official Python 3.15, and uninstalling

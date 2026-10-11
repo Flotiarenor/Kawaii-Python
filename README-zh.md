@@ -114,18 +114,20 @@ $ python -c "print(input().encode('utf-8').hex())"
 
 ## 哪些消息换不了
 
-有几种异常，你给它们写条目也没用——程序**保留原文**，因为改写后反而会显示得更糟。这是设计，
-不是坏了：
+`KeyError`、带 `errno` 的 `OSError` / `FileNotFoundError`、`UnicodeDecodeError` 和自己写了
+`__str__` 的子类现在都能替换：它们的显示文本不来自 `args[0]`，于是程序把副本做成一层次子类，
+让它的 `__str__` 直接返回你的文案，异常名和 `isinstance` 都不变。
+
+`SyntaxError` 由编译器产生的多参数形态，以及多参数异常，仍然**保留原文**——替掉整行反而会
+丢信息。各类异常的结局：
 
 | 异常 | 结果 | 原因 |
 | --- | --- | --- |
 | `ZeroDivisionError`、`IndexError`、`TypeError`、`AttributeError`、`NameError` 等 | 替换 | 显示的就是报错原文 |
+| `KeyError`、带 `errno` 的 `OSError` / `FileNotFoundError`、`UnicodeDecodeError`、自定义 `__str__` 的子类 | 替换 | 显示不由 `args[0]` 决定，走上面说的显示代理 |
 | `SyntaxError`，**只有单个参数**那种（如 `raise SyntaxError('msg')`） | 替换 | 显示的就是报错原文 |
-| `KeyError` | 保留原文 | 显示的是 `args[0]` 的 repr，改写后会多出一对引号 |
-| 带 `errno` 的 `OSError` / `FileNotFoundError` 等 | 表里有专门的模式键，但保留原文 | 显示由错误号和文件名拼出，改写会丢掉它们 |
-| `UnicodeDecodeError` | 保留原文 | 显示由编码、位置等信息拼出 |
-| `Exception(1, 2)` 这类多参数异常 | 保留原文 | 显示的是参数元组的 repr |
-| 自己写了 `__str__` 的异常子类 | 保留原文 | 显示文本是固定的 |
+| 编译器产生的 `SyntaxError`（`compile()`、`exec()`、导入的文件、REPL 输入） | 保留原文 | 已知缺陷，见 [FORK-NOTICE.md](FORK-NOTICE.md) |
+| `Exception(1, 2)`、`ValueError('a', 'b')` 这类多参数异常 | 保留原文 | 表里查到的是 `args[0]`，显示的却是整个参数元组的 repr |
 
 ## 常见问题
 
@@ -137,8 +139,10 @@ $ python -c "print(input().encode('utf-8').hex())"
 进程第一次用到时读一次。
 
 **为什么有的条目明明在表里，显示出来还是英文？**
-见上一节：`KeyError`、带 `errno` 的 `OSError`、`UnicodeDecodeError` 和自定义 `__str__` 的类型
-不会采用改写。给它们写条目也不会生效。
+先确认键和运行时显示的文本一模一样——差一个空格、换了一个半角标点，这一行就成了死键，
+而且不会报错。两种键最容易写错：`KeyError` 的键是 repr 之后的样子（`'missing'`，带引号），
+`OSError` 的键是整行（`[Errno 2] No such file or directory: 'x'`）。如果碰上的是多参数异常
+或编译器产生的 `SyntaxError`，那是上一节列出的两种保留原文的情形。
 
 **它会替换掉我电脑上的 Python 吗？**
 不会。安装包与官方 Python 3.15 并存安装，装在自己的目录里，卸载也只删自己的文件。

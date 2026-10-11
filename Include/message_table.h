@@ -18,10 +18,14 @@ extern "C" {
  * table has an entry for the message it currently shows.
  *
  * `value` is an exception instance.  Returns a NEW reference to a copy of it
- * with the message rewritten, or NULL when nothing was replaced — either
- * because the table has no matching entry, or because this exception type does
- * not derive its displayed message from args[0] (OSError, UnicodeDecodeError,
- * KeyError, ...).  Callers must treat NULL as "use the original".
+ * whose display carries the replacement, or NULL when nothing was replaced:
+ * the table has no matching entry, or the rewrite cannot be made to show.
+ * A type whose message does not come from args[0] (OSError, UnicodeDecodeError,
+ * KeyError, ...) is copied as a subclass with a __str__ that returns the
+ * replacement; see the display proxy in Objects/message_table.c.  SyntaxError
+ * with more than one argument, and an exception whose display is the repr of a
+ * multi-argument tuple, are left alone.  Callers must treat NULL as "use the
+ * original".
  *
  * Implemented in Objects/message_table.c.
  */

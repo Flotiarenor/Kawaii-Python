@@ -329,6 +329,7 @@ $ not at the end of path	24e6808ee4b988e8b791e588b0e8b7afe5be84e4b8ade997b4e58eb
 '%s' must be between -1 and %d, not %d	e6898de4b88de698afe99a8fe4bebfe5a1abe79a84e591a2efbc8c2573e5bf85e9a1bbe59ca82d31e5928c2564e4b98be997b4efbc8ce588abe7bb99e688912564
 '%s' must be callable, not %s	2573e8a681e883bd63616c6ce5958aefbc8ce7bb99e4b8aa2573e698afe6909ee7ac91e5909728e69d82e9b1bcefbd9e29
 '%s' object cannot be interpreted as an integer	2573e58f98e4b88de68890696e7465676572efbc8ce4babae5aeb6e5be88e4b8bae99abee5958a
+'*' codec can't decode byte * in position *: *	2725312720e8a7a3e7a081e599a8e697a0e6b395e8a7a3e7a081e7acac20253320e4bd8de79a84e5ad97e88a822025323a202534
 '--' is not allowed in a comment node	272d2d27e59ca8e6b3a8e9878ae9878ce698afe4b88de8a18ce79a84e596b5efbd9e
 '=' alignment flag is not allowed in complex format specifier	636f6d706c6578e6a0bce5bc8fe9878ce4b88de883bde794a8273d27e5afb9e9bd90e595a6efbc8ce4bc9ae8a2abe68b92e7bb9de596b5efbd9e
 '=' alignment not allowed in string format specifier	273d27e5afb9e9bd90e59ca8e5ad97e7aca6e4b8b2e6a0bce5bc8fe9878ce4b88de8aea9e794a8e596b5efbd9e

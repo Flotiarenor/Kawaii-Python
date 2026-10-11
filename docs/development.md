@@ -177,7 +177,9 @@ $env:PYTHON_MESSAGE_TABLE = "$PWD\lookup-table.txt"
 .\PCbuild\amd64\python.exe -c "1/0"        # 字面键命中：显示替换后的文本
 .\PCbuild\amd64\python.exe -c "(1).foo"    # 模式键命中：'*' object has no attribute '*'
 .\PCbuild\amd64\python.exe -c "raise ValueError('not in table')"  # 未命中：保持原文
-.\PCbuild\amd64\python.exe -c "open('/nope')"   # 命中模式键但显示不成立：按闸门保留原文
+.\PCbuild\amd64\python.exe -c "open('/nope')"   # 显示不来自 args[0]：走显示代理
+.\PCbuild\amd64\python.exe -c "b'\xff'.decode('utf-8')"  # 同上，表里有键时
+.\PCbuild\amd64\python.exe -c "raise ValueError('a', 'b')"  # 多参数：保留原文
 .\PCbuild\amd64\python.exe                   # REPL 里 >>> 1/0 也必须被替换
 ```
 
@@ -223,7 +225,11 @@ UTF-8，BOM 会被悄悄塞进第一个键里。
 ```
 division by zero	e7aca8e89b8be6898de4bc9ae68a8a30e694bee588b0e999a4e695b0e590a7efbc81
 '*' object has no attribute '*'	2725312720e5afb9e8b1a1e6b2a1e69c89e5b19ee680a72027253227
+[Errno *] *: '*'	5be99499e8afafe7a0812025315d2025323a2027253327
+'*' codec can't decode byte * in position *: *	2725312720e8a7a3e7a081e599a8e697a0e6b395e8a7a3e7a081e7acac20253320e4bd8de79a84e5ad97e88a822025323a202534
 ```
+
+后两条是显示代理那两类用的：捕获从整行显示文本里取，替换文本又把捕获拼回整行。
 
 表在第一次用到时读一次并常驻内存，所以改完表要重开进程。
 
@@ -244,32 +250,37 @@ division by zero	e7aca8e89b8be6898de4bc9ae68a8a30e694bee588b0e999a4e695b0e590a7e
 
 ## 哪些消息能被替换
 
-判定分两步。
+判定分三步。
 
 第一步选要查的文本：类型用标准 `__str__`（按 `tp_str` 比较，不分配对象）时取 `args[0]`，
 否则取异常真实显示的文本——**这一步正是模式键能覆盖到"文本不是 `args[0]`"的类型的入口**。
 
 第二步，改写完成后让副本再显示一次：只有显示结果**恰好等于**新文本才保留改写
 （`SyntaxError` 按"以新文本开头"放行，位置字段一并搬运）。过不了这一步的改写会被丢弃，而不是
-打出来。没有第二步，副本会显示成没人要的东西——`KeyError` 会显示新文本的 `repr()`，带 `errno`
-的 `OSError` 会显示一个元组，`UnicodeDecodeError` 的副本什么都显示不出来。
+打出来——`KeyError` 会显示新文本的 `repr()`，带 `errno` 的 `OSError` 会显示一个元组，
+`UnicodeDecodeError` 的副本什么都显示不出来。
+
+第三步，对过不了第二步的类型（显示文本压根不来自 `args[0]`）改用**显示代理**：副本的类型是原
+异常类型的一层子类，它的 `__str__` 直接返回替换文本。用子类而不是自造一个异常类，是为了异常名
+（`traceback` 读 `__qualname__` 与 `__module__`，C 回退路径读 `tp_name`）与 `isinstance()`
+判定都保持不变。子类按原类型缓存，一个类型只建一次，只用公开 C API（`type()`、
+`PyDescr_NewMethod()`），不 import 任何 Python 代码。
 
 | 异常 | 结果 | 原因 |
 | --- | --- | --- |
 | `ZeroDivisionError`、`IndexError`、`TypeError`、`AttributeError`、`NameError`、`RecursionError`、`ImportError` 等 | 替换 | 显示文本就是 `args[0]` |
 | 继承标准 `__str__` 的子类 | 替换 | 同上 |
+| `KeyError` | 走显示代理替换 | 显示文本是 `repr(args[0])`，改 `args` 改不动它 |
+| 带 `errno` 的 `OSError` 及其子类 | 走显示代理替换 | 显示文本由 `errno`／`strerror`／`filename` 拼出 |
+| `UnicodeDecodeError`（以及自带 `__str__` 的其它 `UnicodeError`） | 走显示代理替换 | 显示文本由 `encoding/object/start/end/reason` 拼出，用 `__new__` 造的副本没有 `object` 成员 |
+| 覆盖了 `__str__` 的子类 | 走显示代理替换 | 显示文本是固定的，改 `args` 改不动它 |
 | `SyntaxError`，单个参数 | 替换 | 显示文本就是 `args[0]` |
-| `SyntaxError`，多参数（`compile()`、`exec()`、导入文件时产生的就是这种） | **不替换** | 见下方"已知缺陷" |
-| `KeyError` | 表里查到了，但保留原文 | 显示文本是 `repr(args[0])`，改写后会多出引号 |
-| 带 `errno` 的 `OSError` 及其子类 | 表里查到了，但保留原文 | 显示文本由 `errno`／`strerror`／`filename` 拼出 |
-| `UnicodeDecodeError` | 表里查到了，但保留原文 | 显示文本由 `encoding/object/start/end/reason` 拼出，用 `__new__` 造的副本没有 `object` 成员 |
-| `Exception(1, 2)` 这类多参数异常 | 表里查到了，但保留原文 | 显示的是参数元组的 repr |
-| 覆盖了 `__str__` 的子类 | 永远不匹配 | 显示文本是固定的 |
+| `SyntaxError`，多参数（`compile()`、`exec()`、导入文件、REPL 输入产生的都是这种） | **不替换** | 见下方"已知缺陷"；代理也刻意跳过它，否则会丢掉文件、行号与插入符 |
+| `Exception(1, 2)`、`ValueError('a', 'b')` 这类多参数异常 | 表里查到了，但保留原文 | 查的是 `args[0]`，显示的是整个参数元组的 repr，替掉整行会丢掉参数 |
 
 「表里查到了，但保留原文」是设计结果而不是故障：条目可达，但改写会打出比原文更糟的东西，所以
-丢弃。两行最令人意外的结论来自上游的
-[Objects/exceptions.c:3867](../Objects/exceptions.c#L3867)（`UnicodeDecodeError` 的空副本）与
-[Objects/exceptions.c:2927](../Objects/exceptions.c#L2927)（`SyntaxError` 渲染位置之处）。
+丢弃。上游的 [Objects/exceptions.c:3867](../Objects/exceptions.c#L3867)（`UnicodeDecodeError`
+用 `__new__` 造出来时显示空串）正是这类类型必须走显示代理的原因。
 
 ## 文档分工与政策
 
@@ -314,6 +325,9 @@ SyntaxError: invalid syntax     # 不生效
 影响：日常遇到的语法错误都是多参数形态，所以文档里承诺的 `SyntaxError` 替换对它们不成立。
 单参数形态本来就没有位置信息可丢，所以早期"改写会保留文件与行号"的说法描述的是一个不可能
 发生的情形；README 现在写明覆盖的是哪种形态。
+
+显示代理也刻意跳过 `SyntaxError`：它的 `__str__` 同时渲染文件、行号与插入符，代理只会打出裸的
+替换文本，把这三点全丢掉。多参数形态因此仍然保留原文，位置信息一并保留。
 
 ## 已知未做
 

@@ -18,7 +18,7 @@
   | [Python/pylifecycle.c](Python/pylifecycle.c) | `_Py_Finalize()` 里调用 `_PyMessageTable_Fini()` 释放缓存表 |
   | [Include/cpython/unicodeobject.h](Include/cpython/unicodeobject.h) | 文件末尾 `#include "message_table.h"` |
   | [Include/message_table.h](Include/message_table.h) | 三个内部函数的声明 |
-  | [Objects/message_table.c](Objects/message_table.c) | 表的加载、hex 解码、查找、改写与"能否替换"的判定 |
+  | [Objects/message_table.c](Objects/message_table.c) | 表的加载、hex 解码、查找、改写、显示代理与"能否替换"的判定 |
   | lookup-table.txt（仓库根目录） | **交付物本体**：替换用的查询表，受版本控制、随仓库分发 |
   | [Makefile.pre.in](Makefile.pre.in)、[PCbuild/pythoncore.vcxproj](PCbuild/pythoncore.vcxproj)、[PCbuild/_freeze_module.vcxproj](PCbuild/_freeze_module.vcxproj) | 把新源文件编进 `pythoncore` |
 
@@ -26,8 +26,8 @@
   与 `traceback` 模块不可用时的 C 回退都从这里出去，一处覆盖全部。**REPL 不走
   `sys.excepthook`**，所以纯 Python 实现覆盖不到这一条，钩子必须在 C 里。
 - 实现只用公开 C API、不 import Python 代码：import 机制损坏时 traceback 仍要打得出来。
-- `_PyErr_Message_Replace()` 返回新引用（改写后的副本）或 `NULL`（表里没有这条，或该类型
-  的显示文本不来自 `args[0]`）。调用方必须把 `NULL` 当作"用原来的"。
+- `_PyErr_Message_Replace()` 返回新引用（改写后的副本）或 `NULL`（表里没有这条，或改写无法
+  显示出来）。调用方必须把 `NULL` 当作"用原来的"。
 - 上游风格照旧生效：C 遵守 [PEP 7](https://peps.python.org/pep-0007/)、Python 遵守
   [PEP 8](https://peps.python.org/pep-0008/)。**新增符号一律加 `_Py` 前缀并保持内部可见**：
   [b41bab3](https://github.com/Flotiarenor/Kawaii-Python/commit/b41bab3) 把 `PyUnicode_FromHex` 改成
@@ -131,7 +131,9 @@
    .\PCbuild\amd64\python.exe -c "1/0"        # 字面键命中：显示替换后的文本
    .\PCbuild\amd64\python.exe -c "(1).foo"    # 模式键命中：'*' object has no attribute '*'
    .\PCbuild\amd64\python.exe -c "raise ValueError('not in table')"  # 未命中：保持原文
-   .\PCbuild\amd64\python.exe -c "open('/nope')"   # 命中模式键但显示不成立：按闸门保留原文
+   .\PCbuild\amd64\python.exe -c "open('/nope')"   # 显示不来自 args[0]：走显示代理
+   .\PCbuild\amd64\python.exe -c "b'\xff'.decode('utf-8')"  # 同上，表里有键时
+   .\PCbuild\amd64\python.exe -c "raise ValueError('a', 'b')"  # 多参数：按闸门保留原文
    .\PCbuild\amd64\python.exe                   # REPL 里 >>> 1/0 也必须被替换
    ```
 
@@ -148,11 +150,12 @@
    `division by zero` 与 `list index out of range` 这两条要保持可用（README 与
    [FORK-NOTICE.md](FORK-NOTICE.md) 的示例以它们为依据；注意 `[][0]` 不是键，`IndexError` 的键是
    `list index out of range`）。
-   **验收要看"副本显示成什么"**：改写只在副本的显示恰好等于新文本时才生效；`KeyError`、带
-   errno 的 `OSError`、`UnicodeDecodeError` 与自定义 `__str__` 的类型会被这道闸门挡下、保留
-   原文——这是设计，不是失败。闸门里另有一条"以新文本开头即放行"的分支是给 `SyntaxError` 留的
-   （它会在文案后面追加 `(<file>, line N)`），但**多参数 SyntaxError 根本走不到那一步**，见下方
-   的已知缺陷。
+   **验收要看"副本显示成什么"**：改写只在副本的显示恰好等于新文本时才生效。过不了这道闸门的
+   类型——`KeyError`、带 errno 的 `OSError`、`UnicodeDecodeError`、自定义 `__str__` 的子类——
+   改走**显示代理**：副本是原子类的一层子类，`__str__` 直接返回新文本，异常名与 `isinstance`
+   不变；代理建不出来（例如基类的 `__init_subclass__` 会抛）时才保留原文。`SyntaxError` 仍走
+   "以新文本开头即放行"的分支（它会在文案后面追加 `(<file>, line N)`），代理刻意跳过它；**多参数
+   SyntaxError 根本走不到那一步**，见下方的已知缺陷。
 4. `git status` 确认没把构建产物与日志带进提交。
 
 ## 提交信息规范

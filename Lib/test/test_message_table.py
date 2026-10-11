@@ -8,8 +8,11 @@ inside _PyErr_Display().
 Three properties matter beyond "the replacement shows up":
 
 * a message the table does not cover must come out exactly as upstream prints it;
-* a type whose display is not derived from args[0] must keep its original text
-  even when a pattern matches it (the display gate);
+* a type whose display is not derived from args[0] must still show the
+  replacement -- it is carried by a display proxy, a subclass whose __str__
+  returns the table's text -- while a display the table only saw part of (the
+  repr of a multi-argument tuple, a SyntaxError carrying a location) must keep
+  its original text;
 * the interactive loop must be covered too, because it never calls
   sys.excepthook -- that is the whole reason this feature lives in C.
 """
@@ -92,23 +95,61 @@ class MessageTableTests(unittest.TestCase):
             "-c", "1/0", PYTHON_MESSAGE_TABLE=missing, PYTHON_COLORS="0")
         self.assertIn(b"ZeroDivisionError: division by zero", err)
 
-    def test_gate_rejects_a_key_that_would_break_the_display(self):
-        # KeyError displays repr(args[0]), so rewriting args would print
-        # "'<new text>'".  The entry is found and then discarded on purpose.
+    def test_keyerror_display_is_replaced(self):
+        # KeyError displays repr(args[0]).  Rewriting args would print the new
+        # text with a pair of quotes around it, so the display proxy carries
+        # the text instead.
         table = self.write_table(entry("'missing'", "换掉了"))
         rc, out, err = self.run_script(table, "{}['missing']")
         self.assertNotEqual(rc, 0)
-        self.assertIn("KeyError: 'missing'", err)
-        self.assertNotIn("换掉了", err)
+        self.assertIn("KeyError: 换掉了", err)
+        self.assertNotIn("KeyError: 'missing'", err)
 
-    def test_oserror_with_errno_keeps_its_display(self):
-        # Same gate, other shape: the display is built from errno/strerror, and
-        # a copy would print a tuple instead.
-        table = self.write_table(entry("*", "换掉了"))
+    def test_oserror_with_errno_is_replaced(self):
+        # The display is built from errno/strerror/filename, so args[0] is not
+        # where the text comes from: the captures of the pattern fill the
+        # value, and the display proxy shows it.
+        table = self.write_table(
+            entry("[Errno *] *: '*'", "[错误码 %1] %2: '%3'"))
         rc, out, err = self.run_script(table, "open('no-such-file-xyz')")
         self.assertNotEqual(rc, 0)
-        self.assertIn("FileNotFoundError", err)
+        self.assertIn("FileNotFoundError: [错误码 2] No such file or directory:"
+                      " 'no-such-file-xyz'", err)
+
+    def test_unicode_decode_error_is_replaced(self):
+        table = self.write_table(entry(
+            "'utf-8' codec can't decode byte 0xff in position 0:"
+            " invalid start byte", "解码失败"))
+        rc, out, err = self.run_script(table, "b'\\xff'.decode('utf-8')")
+        self.assertNotEqual(rc, 0)
+        self.assertIn("UnicodeDecodeError: 解码失败", err)
+        self.assertNotIn("codec can't decode", err)
+
+    def test_type_with_its_own_str_is_replaced(self):
+        table = self.write_table(entry("weird message", "很奇怪的消息"))
+        code = ("class Weird(Exception):\n"
+                "    def __str__(self):\n"
+                "        return 'weird message'\n"
+                "raise Weird()\n")
+        _, _, err = self.run_script(table, code)
+        self.assertIn("Weird: 很奇怪的消息", err)
+
+    def test_multi_argument_display_keeps_its_text(self):
+        # The lookup runs on args[0], but the display is the repr of the whole
+        # tuple, so replacing it would drop the other arguments.
+        table = self.write_table(entry("a", "换掉了"))
+        _, _, err = self.run_script(table, "raise ValueError('a', 'b')")
+        self.assertIn("ValueError: ('a', 'b')", err)
         self.assertNotIn("换掉了", err)
+
+    def test_syntax_error_with_a_location_keeps_its_text(self):
+        # Multi-argument SyntaxError is a known defect (see FORK-NOTICE.md).
+        # The display proxy must not turn it into a bare replacement either,
+        # which would drop the file, the line and the caret.
+        table = self.write_table(entry("invalid syntax", "语法无效"))
+        _, _, err = self.run_script(table, "compile('1 +', '<demo>', 'exec')")
+        self.assertIn("SyntaxError: invalid syntax", err)
+        self.assertNotIn("语法无效", err)
 
     def test_key_may_start_with_a_hash(self):
         # A leading '#' is a comment only without a TAB; dropping this entry
