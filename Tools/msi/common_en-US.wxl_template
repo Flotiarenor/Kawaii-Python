@@ -3,7 +3,7 @@
     <String Id="LCID">1033</String>
     <String Id="Culture">en-us</String>
     <String Id="ProductName">Python {{ShortVersion}}</String>
-    <String Id="FullProductName">Kawaii-Python {{PyVersion}} ({{Bitness}})</String>
+    <String Id="FullProductName">Kawaii-Python {{NumericVersion}} ({{Bitness}})</String>
     <String Id="Title">Python {{LongVersion}} !(loc.Descriptor) ({{Bitness}})</String>
     <String Id="Description">Python {{LongVersion}} !(loc.Descriptor) ({{Bitness}})</String>
     <String Id="TitlePdb">Python {{LongVersion}} !(loc.Descriptor) ({{Bitness}} symbols)</String>
