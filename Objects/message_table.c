@@ -51,6 +51,33 @@
  * replacement that refers to a capture the pattern does not have ("%2" for a
  * pattern with one '*', or "%0") is refused and the original message is kept,
  * and so is a pattern with more than 64 wildcards.
+ *
+ * What the reader accepts, and where it looks, is part of the format:
+ *
+ *   - A line is at most MESSAGE_TABLE_MAX_LINE bytes including the newline.  A
+ *     longer line is skipped as a whole and counted, never truncated silently:
+ *     half an entry would replace a message with text nobody wrote.
+ *   - A line holding a NUL byte is skipped, because everything downstream
+ *     treats the line as text and a NUL would cut it in half invisibly.
+ *   - Both halves have to be valid UTF-8.  The key is decoded directly, the
+ *     value after hex decoding, and an entry whose bytes are not UTF-8 is
+ *     dropped whole instead of being replaced with U+FFFD.
+ *   - An empty replacement is allowed: an entry that maps a message to nothing
+ *     is a way to silence it on purpose, which is different from a malformed
+ *     line and is therefore not rejected.
+ *   - The table itself is capped as well (MESSAGE_TABLE_MAX_BYTES on disk,
+ *     MESSAGE_TABLE_MAX_ENTRIES entries) and has to be a regular file.  The
+ *     loader runs while an exception is being displayed, so a table that is a
+ *     FIFO, a device or simply enormous must not be able to hang or exhaust the
+ *     process from there.
+ *   - The lookup walks the candidates in order and takes the first one that
+ *     opens: $PYTHON_MESSAGE_TABLE, $PYTHONHOME/lookup-table.txt,
+ *     <sys.prefix>/lookup-table.txt and finally ./lookup-table.txt.  A
+ *     candidate that cannot be read does not stop the walk, and a table that
+ *     appears later in the life of the process is picked up by the next
+ *     lookup.  The two environment candidates are skipped under -E and the
+ *     current directory under -I; "-X message-table=off" switches the whole
+ *     feature off for a run.
  */
 
 #if defined(MESSAGE_TABLE_PATTERN_TEST)
@@ -81,6 +108,11 @@
 
 #include <errno.h>
 #include <string.h>
+#include <sys/stat.h>
+
+#if defined(MS_WINDOWS)
+#  include <io.h>                  /* _fileno(), _fstat64() */
+#endif
 
 /* ------------------------------------------------------------------ */
 /* pattern engine (no Python API)                                      */
@@ -95,8 +127,13 @@
 #define MESSAGE_PATTERN_WILDCARD '*'
 #define MESSAGE_PATTERN_REFERENCE '%'
 
-/* Longest table line, replacement included. */
-#define MESSAGE_TABLE_MAX_LINE 4096
+/*
+ * Longest accepted table line, replacement included, newline counted.  A
+ * longer line is skipped whole (see the file comment): the loader no longer
+ * reads through a fixed-size buffer, so nothing is truncated by accident, and
+ * this is a policy limit rather than a buffer size.
+ */
+#define MESSAGE_TABLE_MAX_LINE 16384
 
 /*
  * Upper bound on the wildcards of one pattern.  A pattern is hand-written text
@@ -113,8 +150,26 @@
  * cost far more than a table author would expect.  Running out of budget is
  * reported as "no match", which has the same visible result as a pattern that
  * does not match: the original message is printed.
+ *
+ * This bound is per pattern.  Checking a whole table is bounded as well, by
+ * MESSAGE_PATTERN_CALL_BUDGET below, because a table with thousands of
+ * pathological patterns would otherwise add up: the per-pattern bound alone
+ * lets every one of them spend its own budget, which is what turned a large
+ * hand-written table into minutes of work for a single traceback.
  */
 #define MESSAGE_PATTERN_BUDGET 1000000
+
+/*
+ * How many positions one lookup may try across every pattern of the table.
+ * Generated patterns can be worse than hand-written ones, and a table is read
+ * from a path an attacker may control, so the total is bounded here: once the
+ * shared budget runs out the remaining patterns count as non-matching and the
+ * original message is printed.  The value covers a large table of ordinary
+ * patterns with room to spare (the shipped table needs a few thousand steps in
+ * the worst case) while keeping the tail of a hostile table in the millisecond
+ * range.
+ */
+#define MESSAGE_PATTERN_CALL_BUDGET 10000000
 
 typedef struct {
     const char *text;
@@ -123,7 +178,9 @@ typedef struct {
     size_t pattern_size;
     size_t star_count;
     size_t *captures;           /* (offset, size) per wildcard, or NULL */
-    size_t budget;
+    size_t budget;              /* positions left for this pattern */
+    size_t *shared_budget;      /* positions left for the whole lookup, or
+                                   NULL when only one pattern is checked */
 } PatternSearch;
 
 /*
@@ -245,10 +302,14 @@ pattern_search(PatternSearch *search, size_t index, size_t position)
            message, not a part of it. */
         return after == search->text_size;
     }
-    if (search->budget == 0) {
+    if (search->budget == 0
+        || (search->shared_budget != NULL && *search->shared_budget == 0)) {
         return 0;
     }
     search->budget--;
+    if (search->shared_budget != NULL) {
+        (*search->shared_budget)--;
+    }
 
     for (size_t end = after; ;
          end += pattern_char_size(search->text, search->text_size, end)) {
@@ -271,11 +332,15 @@ pattern_search(PatternSearch *search, size_t index, size_t position)
  * with `star_count` (offset, size) pairs, one per wildcard in order of
  * appearance, and returns 1; otherwise returns 0 and leaves `captures` alone.
  * Pass NULL for `captures` to ask whether the pattern matches at all.
+ *
+ * `shared_budget` points at the positions left for the whole lookup, or is
+ * NULL for a single check; both budgets are spent together and running out of
+ * either one counts as "no match".
  */
 static int
 pattern_match(const char *pattern, size_t pattern_size,
               const char *text, size_t text_size,
-              size_t star_count, size_t *captures)
+              size_t star_count, size_t *shared_budget, size_t *captures)
 {
     PatternSearch search;
     search.text = text;
@@ -285,6 +350,7 @@ pattern_match(const char *pattern, size_t pattern_size,
     search.star_count = star_count;
     search.captures = captures;
     search.budget = MESSAGE_PATTERN_BUDGET;
+    search.shared_budget = shared_budget;
     return pattern_search(&search, 0, 0);
 }
 
@@ -412,28 +478,21 @@ pattern_expand(const char *replacement, size_t replacement_size,
 #define MESSAGE_TABLE_SEPARATOR '\t'
 #define MESSAGE_TABLE_COMMENT '#'
 
-/* Drop the leading and trailing blanks of a line, in place. */
-static char *
-trim_line(char *line)
+/* Blanks a line may be padded with, on either side of the separator. */
+static int
+table_blank(int ch)
 {
-    while (*line == ' ' || *line == '\t' || *line == '\r' || *line == '\n') {
-        line++;
-    }
-    size_t len = strlen(line);
-    while (len > 0) {
-        char last = line[len - 1];
-        if (last != ' ' && last != '\t' && last != '\r' && last != '\n') {
-            break;
-        }
-        line[--len] = '\0';
-    }
-    return line;
+    return ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n';
 }
 
 /*
- * Split one line of the table into its key and its hex-encoded value, in
- * place: the line is cut at the first TAB, and both halves are trimmed, so
+ * Split one line of `line_size` bytes into its key and its hex-encoded value,
+ * in place: the line is cut at the first TAB, and both halves are trimmed, so
  * extra blanks around the separator and a trailing TAB are harmless.
+ *
+ * The line is handled by its length, never by strlen(): a table line may hold
+ * a NUL byte, and treating one as the end of the line would cut an entry in
+ * half invisibly.  A NUL anywhere in the line makes it malformed instead.
  *
  * Presence of the TAB decides what the line is, so a message that begins with
  * '#' is safe: "# channels not specified" is one CPython prints, and the old
@@ -442,28 +501,67 @@ trim_line(char *line)
  *
  * Returns 1 when the line holds an entry and fills *key and *hex with pointers
  * into it, 0 for a line to ignore (blank or a '#' comment), and -1 for a
- * malformed line: one without a TAB that is not a comment, or with an empty key
- * or an empty value.  Callers skip anything but 1, which keeps a broken table
- * from stopping the interpreter from printing the original message.
+ * malformed line: one without a TAB that is not a comment, one holding a NUL,
+ * or one with an empty key.  An empty value is an entry, not a malformed line:
+ * mapping a message to nothing is how a table silences it.  Callers skip
+ * anything but 1, which keeps a broken table from stopping the interpreter
+ * from printing the original message.
+ *
+ * Both pointers are NUL-terminated, so a caller that wants the lengths of the
+ * two halves has to measure them -- which the loader does with strlen() on
+ * purpose: a NUL inside the line was rejected above.
  */
 static int
-table_split_line(char *line, char **key, char **hex)
+table_split_line(char *line, size_t line_size, char **key, char **hex)
 {
-    char *text = trim_line(line);
-    if (text[0] == '\0') {
-        return 0;
+    if (memchr(line, '\0', line_size) != NULL) {
+        return -1;
     }
-    char *separator = strchr(text, MESSAGE_TABLE_SEPARATOR);
+
+    size_t start = 0;
+    size_t end = line_size;
+    /* Only the leading blanks are trimmed here.  Trimming the tail first would
+       eat a trailing TAB, and "key\t" is exactly how an empty replacement is
+       written: the halves are trimmed separately below. */
+    while (start < end && table_blank(line[start])) {
+        start++;
+    }
+    while (end > start && table_blank(line[end - 1])
+           && line[end - 1] != MESSAGE_TABLE_SEPARATOR) {
+        end--;
+    }
+    if (start == end) {
+        return 0;                   /* blank */
+    }
+
+    char *text = line + start;
+    size_t text_size = end - start;
+    char *separator = memchr(text, MESSAGE_TABLE_SEPARATOR, text_size);
     if (separator == NULL) {
         /* No TAB: a comment if it starts with '#', otherwise malformed. */
         return (text[0] == MESSAGE_TABLE_COMMENT) ? 0 : -1;
     }
-    *separator = '\0';
-    *key = trim_line(text);
-    *hex = trim_line(separator + 1);
-    if (*key[0] == '\0' || *hex[0] == '\0') {
+
+    size_t key_size = (size_t)(separator - text);
+    char *value = separator + 1;
+    size_t value_size = text_size - key_size - 1;
+    while (key_size > 0 && table_blank(text[key_size - 1])) {
+        key_size--;
+    }
+    while (value_size > 0 && table_blank(value[0])) {
+        value++;
+        value_size--;
+    }
+    while (value_size > 0 && table_blank(value[value_size - 1])) {
+        value_size--;
+    }
+    if (key_size == 0) {
         return -1;
     }
+    text[key_size] = '\0';
+    value[value_size] = '\0';
+    *key = text;
+    *hex = value;
     return 1;
 }
 
@@ -614,16 +712,20 @@ static const SplitCase split_cases[] = {
        the splitter's job is only to hand the halves over). */
     {"   # comment\twith a TAB", 1, "# comment", "with a TAB"},
 
-    /* Malformed lines: no TAB (which includes the old comma format), an empty
-       key and an empty value.  Leading blanks are trimmed before the separator
-       is looked for, so a line that starts with the separator reaches this
-       branch as "no separator" instead. */
+    /* Malformed lines: no TAB (which includes the old comma format) and an
+       empty key.  Leading blanks are trimmed before the separator is looked
+       for, so a line that starts with the separator reaches this branch as
+       "no separator" instead. */
     {"byte must be in range(0, 256)", -1, NULL, NULL},
     {"division by zero,e7aca8", -1, NULL, NULL},
     {"\te7aca8", -1, NULL, NULL},
-    {"division by zero\t", -1, NULL, NULL},
-    {"division by zero\t   ", -1, NULL, NULL},
-    {"division by zero\t\t\t", -1, NULL, NULL},
+    {"   \te7aca8", -1, NULL, NULL},
+
+    /* An empty value is an entry: it maps the message to nothing, which is how
+       a table silences a message on purpose.  Only the key has to be there. */
+    {"division by zero\t", 1, "division by zero", ""},
+    {"division by zero\t   ", 1, "division by zero", ""},
+    {"division by zero\t\t\t", 1, "division by zero", ""},
 };
 
 static int pattern_test_checks = 0;
@@ -663,7 +765,7 @@ check_split(const SplitCase *test)
     snprintf(buffer, sizeof(buffer), "%s", test->line);
     char *key = NULL;
     char *hex = NULL;
-    int verdict = table_split_line(buffer, &key, &hex);
+    int verdict = table_split_line(buffer, strlen(buffer), &key, &hex);
 
     pattern_test_checks++;
     printf("      line=");
@@ -723,7 +825,7 @@ check_case(const PatternCase *test)
     size_t stars = pattern_star_count(test->pattern, pattern_size);
     size_t captures[2 * MESSAGE_PATTERN_MAX_STARS];
     int matched = pattern_match(test->pattern, pattern_size,
-                                test->text, text_size, stars, captures);
+                                test->text, text_size, stars, NULL, captures);
 
     pattern_test_checks++;
     printf("      pattern=");
@@ -888,7 +990,7 @@ run_stdin_cases(void)
         size_t stars = pattern_star_count(pattern, pattern_size);
         size_t captures[2 * MESSAGE_PATTERN_MAX_STARS];
         int matched = pattern_match(pattern, pattern_size, text, text_size,
-                                    stars, captures);
+                                    stars, NULL, captures);
         printf("%d\t%lu", matched, (unsigned long)stars);
         if (matched) {
             for (size_t i = 0; i < stars; i++) {
@@ -940,7 +1042,7 @@ run_split_cases(void)
         /* fgets() keeps the newline; the splitter trims it off. */
         char *key = NULL;
         char *hex = NULL;
-        int verdict = table_split_line(line, &key, &hex);
+        int verdict = table_split_line(line, strlen(line), &key, &hex);
         printf("%d", verdict);
         putchar('\t');
         if (verdict == 1) {
@@ -951,6 +1053,43 @@ run_split_cases(void)
         putchar('\n');
     }
     return 0;
+}
+
+/*
+ * Lines that cannot be written as a plain C string for the splitter's table
+ * above: a NUL byte is part of the line and makes it malformed rather than
+ * ending it, so these cases hand the length over explicitly.
+ */
+static void
+check_raw_split_cases(void)
+{
+    static const struct {
+        const char *bytes;
+        size_t size;
+        int verdict;
+    } cases[] = {
+        {"division by zero\te7\x00" "aca8",
+         sizeof("division by zero\te7\x00" "aca8") - 1, -1},
+        {"divi\x00" "sion by zero\te7aca8",
+         sizeof("divi\x00" "sion by zero\te7aca8") - 1, -1},
+        {"division by zero\t", sizeof("division by zero\t") - 1, 1},
+        {"division by zero\t\x00", sizeof("division by zero\t\x00") - 1, -1},
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char buffer[MESSAGE_TABLE_MAX_LINE];
+        char *key = NULL;
+        char *hex = NULL;
+        memcpy(buffer, cases[i].bytes, cases[i].size);
+        int verdict = table_split_line(buffer, cases[i].size, &key, &hex);
+        pattern_test_checks++;
+        printf("      raw line of %lu bytes: verdict=%d (expected %d)\n",
+               (unsigned long)cases[i].size, verdict, cases[i].verdict);
+        if (verdict != cases[i].verdict) {
+            pattern_test_failures++;
+            printf("FAIL  raw split case %lu\n", (unsigned long)(i + 1));
+        }
+    }
 }
 
 int
@@ -973,6 +1112,7 @@ main(int argc, char **argv)
     for (size_t i = 0; i < sizeof(split_cases) / sizeof(split_cases[0]); i++) {
         check_split(&split_cases[i]);
     }
+    check_raw_split_cases();
 
     printf("matching and expansion\n");
     for (size_t i = 0;
@@ -1007,53 +1147,301 @@ typedef struct {
 } MessageEntry;
 
 typedef struct {
-    MessageEntry *entries;
-    Py_ssize_t count;
-    Py_ssize_t pattern_count;   /* entries with at least one wildcard */
+    PyObject *literals;         /* dict: message -> replacement, no wildcard */
+    MessageEntry *patterns;     /* entries whose key holds at least one '*' */
+    Py_ssize_t pattern_count;
+    Py_ssize_t pattern_capacity;
+    Py_ssize_t entry_count;     /* literals plus patterns */
+    Py_ssize_t lines_skipped;   /* malformed lines, for the diagnostic */
+    Py_ssize_t lines_too_long;  /* lines past MESSAGE_TABLE_MAX_LINE */
 } MessageTable;
 
 #define MESSAGE_TABLE_ENV "PYTHON_MESSAGE_TABLE"
 #define MESSAGE_TABLE_DEFAULT "lookup-table.txt"
 
-static MessageTable *message_table = NULL;   /* NULL: not loaded yet */
-static int message_table_failed = 0;         /* 1: load attempted and failed */
+/*
+ * The loaded table is a capsule in the interpreter's own dict, and the proxy
+ * cache a list beside it.  Two properties come out of that, both of them
+ * requirements rather than conveniences:
+ *
+ *   - Per interpreter.  The table holds str objects and the proxy cache holds
+ *     types, so sharing them between interpreters would hand objects owned by
+ *     one interpreter to another (and, with per-interpreter allocators, free
+ *     them from the wrong one).  A subinterpreter now builds its own table and
+ *     its own proxies, and both die with the interpreter's dict.
+ *   - No lock needed.  The capsule's payload is immutable once published, so a
+ *     reader only has to keep the capsule alive, which PyDict_GetItemRef() and
+ *     PyDict_SetDefaultRef() do atomically even without the GIL.  The proxy
+ *     list is a Python list: appending to it cannot corrupt another reader, and
+ *     a duplicate entry under a race only costs one extra class.
+ */
+#define MESSAGE_TABLE_STATE_KEY "_PyMessageTable_table"
+#define MESSAGE_TABLE_PROXIES_KEY "_PyMessageTable_proxies"
+#define MESSAGE_TABLE_CAPSULE_NAME "kawaii-python.message_table"
 
-static void
-message_table_clear(void)
+/*
+ * Caps on what the loader will take from a path that may be under someone
+ * else's control.  The table is read while an exception is being displayed, so
+ * a table that is enormous, or that is not an ordinary file at all, must not be
+ * able to hold the interpreter there: the size check happens before a byte is
+ * read, and the entry cap bounds what is kept.
+ */
+#define MESSAGE_TABLE_MAX_BYTES (16 * 1024 * 1024)
+#define MESSAGE_TABLE_MAX_ENTRIES 65536
+
+/* Which candidate the table came from, for the diagnostic. */
+typedef enum {
+    MESSAGE_TABLE_SOURCE_ENV = 0,
+    MESSAGE_TABLE_SOURCE_HOME,
+    MESSAGE_TABLE_SOURCE_PREFIX,
+    MESSAGE_TABLE_SOURCE_CWD,
+    MESSAGE_TABLE_SOURCE_COUNT
+} MessageTableSource;
+
+/*
+ * The interpreter dict our state lives in, borrowed, or NULL when the
+ * interpreter has no dict (which is not an error: without a place to keep the
+ * cache there simply is no replacement to apply).
+ */
+static PyObject *
+message_table_interp_dict(void)
 {
-    if (message_table == NULL) {
-        return;
+    PyInterpreterState *interp = PyInterpreterState_Get();
+    if (interp == NULL) {
+        return NULL;
     }
-    for (Py_ssize_t i = 0; i < message_table->count; i++) {
-        Py_XDECREF(message_table->entries[i].key);
-        Py_XDECREF(message_table->entries[i].value);
-    }
-    PyMem_Free(message_table->entries);
-    PyMem_Free(message_table);
-    message_table = NULL;
+    return PyInterpreterState_GetDict(interp);
 }
 
-/* Where to look for the table: environment, then $PYTHONHOME, then cwd. */
-static PyObject *
-message_table_path(void)
+/* Release everything a table owns. */
+static void
+message_table_free(MessageTable *table)
 {
-    const char *env = Py_GETENV(MESSAGE_TABLE_ENV);
-    if (env != NULL && env[0] != '\0') {
-        return PyUnicode_FromString(env);
+    if (table == NULL) {
+        return;
     }
-    const char *home = Py_GETENV("PYTHONHOME");
-    wchar_t *prefix = (home != NULL && home[0] != '\0')
-        ? Py_DecodeLocale(home, NULL) : NULL;
-    PyObject *path = NULL;
-    if (prefix != NULL) {
-        path = PyUnicode_FromFormat("%ls/%s", prefix, MESSAGE_TABLE_DEFAULT);
-        PyMem_RawFree(prefix);
+    Py_XDECREF(table->literals);
+    for (Py_ssize_t i = 0; i < table->pattern_count; i++) {
+        Py_XDECREF(table->patterns[i].key);
+        Py_XDECREF(table->patterns[i].value);
     }
-    if (path == NULL) {
+    PyMem_Free(table->patterns);
+    PyMem_Free(table);
+}
+
+/* Free the table a capsule owns; the capsule API hands over the pointer. */
+static void
+message_table_capsule_free(PyObject *capsule)
+{
+    MessageTable *table = PyCapsule_GetPointer(capsule,
+                                               MESSAGE_TABLE_CAPSULE_NAME);
+    if (table == NULL) {
         PyErr_Clear();
-        path = PyUnicode_FromString(MESSAGE_TABLE_DEFAULT);
+        return;
     }
-    return path;
+    message_table_free(table);
+}
+
+/* ------------------------------------------------------------------ */
+/* where the table lives                                               */
+/* ------------------------------------------------------------------ */
+
+/* One -X option: "off" switches message replacement off for this run. */
+#define MESSAGE_TABLE_XOPTION "message-table"
+#define MESSAGE_TABLE_XOPTION_OFF "off"
+
+/*
+ * sys.<name> as a truth value, 0 when it is missing or false.  The kernel of
+ * the interpreter is running while this is called, so a missing attribute is a
+ * "no", and the error indicator is left exactly as it was found.
+ */
+static int
+message_table_sys_flag(const char *name)
+{
+    PyObject *flags = PySys_GetObject("flags");
+    if (flags == NULL) {
+        PyErr_Clear();
+        return 0;
+    }
+    PyObject *value = PyObject_GetAttrString(flags, name);
+    if (value == NULL) {
+        PyErr_Clear();
+        return 0;
+    }
+    int set = PyObject_IsTrue(value);
+    Py_DECREF(value);
+    if (set < 0) {
+        PyErr_Clear();
+        return 0;
+    }
+    return set;
+}
+
+/* 1 when -X message-table=off was given. */
+static int
+message_table_switched_off(void)
+{
+    PyObject *options = PySys_GetObject("_xoptions");
+    if (options == NULL) {
+        PyErr_Clear();
+        return 0;
+    }
+    if (!PyDict_Check(options)) {
+        return 0;
+    }
+    PyObject *value = NULL;
+    if (PyDict_GetItemStringRef(options, MESSAGE_TABLE_XOPTION, &value) < 0) {
+        PyErr_Clear();
+        return 0;
+    }
+    if (value == NULL) {
+        return 0;
+    }
+    int off = PyUnicode_Check(value)
+        && PyUnicode_CompareWithASCIIString(value,
+                                            MESSAGE_TABLE_XOPTION_OFF) == 0;
+    Py_DECREF(value);
+    PyErr_Clear();                  /* the comparison may have failed */
+    return off;
+}
+
+/*
+ * The value of an environment variable as text, or NULL when it is unset or
+ * empty.
+ *
+ * On Windows the narrow getenv() hands back bytes in the ANSI code page, which
+ * cannot represent a path outside that code page at all: the characters are
+ * already '?' by the time any decoding could help, so a table under such a path
+ * would be read as "not there".  The wide environment is the one that holds
+ * what the user set, which is why the interpreter reads its own variables that
+ * way.  Elsewhere the bytes are in the locale encoding and
+ * PyUnicode_DecodeLocale() turns them into text.
+ *
+ * This does not consult the "ignore environment" flag: the caller decides
+ * whether a variable may be read at all (see message_table_candidate_wanted).
+ */
+static PyObject *
+message_table_env(const char *name, const wchar_t *wname)
+{
+#ifdef MS_WINDOWS
+    wchar_t *value = _wgetenv(wname);
+    if (value == NULL || value[0] == L'\0') {
+        return NULL;
+    }
+    return PyUnicode_FromWideChar(value, -1);
+#else
+    const char *value = getenv(name);
+    if (value == NULL || value[0] == '\0') {
+        return NULL;
+    }
+    return PyUnicode_DecodeLocale(value, NULL);
+#endif
+}
+
+/* Defined with the rest of the file handling, further down. */
+static FILE *message_table_open(PyObject *path);
+
+/*
+ * Is this a source tree rather than an installation?  The table that ships
+ * with a release lives in the installation directory, and a source checkout
+ * has the deliverable of this project at its root -- the very same file name.
+ * Treating the checkout as an installation would rewrite the messages of the
+ * test suite that runs from it, so the shipped-table candidate is skipped
+ * there.  The marker is the one sysconfig.is_python_build() uses:
+ * <prefix>/Modules/Setup (or Setup.local) exists only in a configured source
+ * tree.
+ */
+static int
+message_table_source_tree(PyObject *prefix)
+{
+    static const char *const markers[] = {"Setup", "Setup.local", NULL};
+    for (const char *const *name = markers; *name != NULL; name++) {
+        PyObject *path = PyUnicode_FromFormat("%U/Modules/%s", prefix, *name);
+        if (path == NULL) {
+            PyErr_Clear();
+            return 0;
+        }
+        int exists = 0;
+        FILE *fp = message_table_open(path);
+        if (fp != NULL) {
+            exists = 1;
+            fclose(fp);
+        }
+        Py_DECREF(path);
+        if (exists) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/*
+ * The path of one candidate: <directory>/lookup-table.txt for the candidates
+ * that name a directory, the value of the variable for the one that names a
+ * file, and the bare file name for the current directory.  Returns a new
+ * reference, or NULL.  Whether the candidate may be tried at all is decided by
+ * message_table_candidate_wanted(), not here.
+ */
+static PyObject *
+message_table_candidate(MessageTableSource source)
+{
+    switch (source) {
+    case MESSAGE_TABLE_SOURCE_ENV:
+        return message_table_env(MESSAGE_TABLE_ENV,
+                                 L"" MESSAGE_TABLE_ENV);
+    case MESSAGE_TABLE_SOURCE_HOME: {
+        PyObject *home = message_table_env("PYTHONHOME", L"PYTHONHOME");
+        if (home == NULL) {
+            return NULL;
+        }
+        PyObject *path = PyUnicode_FromFormat("%U/%s", home,
+                                              MESSAGE_TABLE_DEFAULT);
+        Py_DECREF(home);
+        return path;
+    }
+    case MESSAGE_TABLE_SOURCE_PREFIX: {
+        PyObject *prefix = PySys_GetObject("prefix");
+        if (prefix == NULL || !PyUnicode_Check(prefix)) {
+            PyErr_Clear();
+            return NULL;
+        }
+        if (message_table_source_tree(prefix)) {
+            return NULL;
+        }
+        return PyUnicode_FromFormat("%U/%s", prefix, MESSAGE_TABLE_DEFAULT);
+    }
+    case MESSAGE_TABLE_SOURCE_CWD:
+        return PyUnicode_FromString(MESSAGE_TABLE_DEFAULT);
+    default:
+        return NULL;
+    }
+}
+
+/*
+ * Is this candidate to be tried?  -X message-table=off drops all of them, -E
+ * drops the two that come from the environment and -I (which implies -E) drops
+ * the current directory as well: an isolated interpreter must not have its
+ * error messages rewritten by a file somebody else can write.
+ */
+static int
+message_table_candidate_wanted(MessageTableSource source)
+{
+    if (message_table_switched_off()) {
+        return 0;
+    }
+    int ignore_environment = message_table_sys_flag("ignore_environment");
+    int isolated = message_table_sys_flag("isolated");
+    switch (source) {
+    case MESSAGE_TABLE_SOURCE_ENV:
+    case MESSAGE_TABLE_SOURCE_HOME:
+        return !ignore_environment;
+    case MESSAGE_TABLE_SOURCE_CWD:
+        return !isolated;
+    case MESSAGE_TABLE_SOURCE_PREFIX:
+        return 1;
+    default:
+        return 0;
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -1076,30 +1464,36 @@ hex_digit(int ch)
 }
 
 /*
- * Decode a hex string into a str by way of its UTF-8 bytes.
+ * Decode a hex field of `hex_size` bytes into a str by way of its UTF-8 bytes.
  *
- * Validates the input: NULL, an odd length or a non-hex character returns NULL
- * with an exception set instead of silently decoding garbage.  (The original
- * version decoded first and only then looked at the length.)
+ * Validates the input: an odd length, a non-hex character or bytes that are not
+ * UTF-8 return NULL with an exception set instead of silently decoding garbage.
+ * The length is passed in rather than measured, because the field sits in a
+ * line that may hold a NUL byte; the loader rejects such a line before it gets
+ * here, and this keeps the function independent of that decision.
+ *
+ * The decode is strict on purpose: a replacement that is not valid UTF-8 is a
+ * broken entry, and dropping the entry keeps the original message visible,
+ * which is better than printing U+FFFD in its place.
  *
  * File-local on purpose: exporting it would add a public-looking C API that
  * needs documentation, for no gain -- nothing outside this file calls it.
  */
 static PyObject *
-from_hex(const char *hex)
+from_hex(const char *hex, size_t hex_size)
 {
     if (hex == NULL) {
         PyErr_SetString(PyExc_ValueError, "hex string is NULL");
         return NULL;
     }
 
-    size_t len = strlen(hex);
-    if (len % 2 != 0) {
-        PyErr_Format(PyExc_ValueError, "hex string of odd length: %zu", len);
+    if (hex_size % 2 != 0) {
+        PyErr_Format(PyExc_ValueError, "hex string of odd length: %zu",
+                     hex_size);
         return NULL;
     }
 
-    size_t nbytes = len / 2;
+    size_t nbytes = hex_size / 2;
     char *bytes = PyMem_Malloc(nbytes > 0 ? nbytes : 1);
     if (bytes == NULL) {
         PyErr_NoMemory();
@@ -1118,7 +1512,8 @@ from_hex(const char *hex)
         bytes[i] = (char)((hi << 4) | lo);
     }
 
-    PyObject *result = PyUnicode_DecodeUTF8(bytes, (Py_ssize_t)nbytes, "replace");
+    PyObject *result = PyUnicode_DecodeUTF8(bytes, (Py_ssize_t)nbytes,
+                                            "strict");
     PyMem_Free(bytes);
     return result;
 }
@@ -1142,13 +1537,17 @@ message_table_open(PyObject *path)
 {
 #ifdef MESSAGE_TABLE_STUB_BUILD
     const char *utf8 = PyUnicode_AsUTF8AndSize(path, NULL);
-    return utf8 != NULL ? fopen(utf8, "r") : NULL;
+    return utf8 != NULL ? fopen(utf8, "rb") : NULL;
 #elif defined(MS_WINDOWS)
     wchar_t *wpath = PyUnicode_AsWideCharString(path, NULL);
     if (wpath == NULL) {
         return NULL;
     }
-    FILE *fp = _wfopen(wpath, L"r");
+    /* Binary mode matters: in text mode the C runtime treats a 0x1A byte as the
+       end of the file, so a table holding one would lose every entry after it
+       -- and lose them silently.  Line ends are stripped by the splitter, which
+       trims '\r' like any other blank. */
+    FILE *fp = _wfopen(wpath, L"rb");
     PyMem_Free(wpath);
     return fp;
 #else
@@ -1156,37 +1555,91 @@ message_table_open(PyObject *path)
     if (bytes == NULL) {
         return NULL;
     }
-    FILE *fp = fopen(PyBytes_AS_STRING(bytes), "r");
+    FILE *fp = fopen(PyBytes_AS_STRING(bytes), "rb");
     Py_DECREF(bytes);
     return fp;
 #endif
 }
 
 /*
- * Prepare one entry of the table, appending it to `table`.
+ * Is this an ordinary file of an acceptable size?  The check happens before a
+ * byte is read: the loader runs while an exception is displayed, so a FIFO (a
+ * read that never returns until someone writes), a device such as /dev/zero (a
+ * read that never ends) or a table far larger than a message table can be must
+ * be refused up front rather than discovered halfway through.
  *
- * A key with no '*' is a literal message and is stored as it is.  A key with
- * at least one '*' is a pattern, and both the pattern and the replacement are
- * cached as UTF-8 bytes: the pattern engine works on bytes, and the cached
- * pointer stays valid because the entry holds a reference to the str that owns
- * it.  A pattern that cannot be encoded, or that has more wildcards than
- * MESSAGE_PATTERN_MAX_STARS, is dropped like a malformed line.
+ * Returns 0 to refuse the file, 1 to read it.
+ */
+static int
+message_table_size_ok(FILE *fp)
+{
+#ifdef MESSAGE_TABLE_STUB_BUILD
+    return 1;
+#else
+#ifdef MS_WINDOWS
+    struct _stat64 info;
+    if (_fstat64(_fileno(fp), &info) != 0) {
+        return 0;
+    }
+    if ((info.st_mode & _S_IFMT) != _S_IFREG) {
+        return 0;
+    }
+    return info.st_size >= 0 && info.st_size <= MESSAGE_TABLE_MAX_BYTES;
+#else
+    struct stat info;
+    if (fstat(fileno(fp), &info) != 0) {
+        return 0;
+    }
+    if (!S_ISREG(info.st_mode)) {
+        return 0;
+    }
+    return info.st_size >= 0 && info.st_size <= MESSAGE_TABLE_MAX_BYTES;
+#endif
+#endif
+}
+
+/*
+ * Prepare one entry of the table.
+ *
+ * A key with no '*' is a literal message and goes into the literals dict, which
+ * answers a lookup in one hashed step.  A key with at least one '*' is a
+ * pattern: both halves are cached as UTF-8 bytes in the entry, because the
+ * pattern engine works on bytes and the cached pointer stays valid as long as
+ * the entry holds a reference to the str that owns it.  A key or value that
+ * cannot be encoded as UTF-8, and a pattern with more wildcards than
+ * MESSAGE_PATTERN_MAX_STARS, are dropped like any other malformed entry.
  */
 static void
-message_table_add(MessageTable *table, char *key, char *hex,
-                  Py_ssize_t *capacity)
+message_table_add(MessageTable *table, char *key, char *hex)
 {
-    PyObject *value = from_hex(hex);
+    PyObject *value = from_hex(hex, strlen(hex));
     if (value == NULL) {
         /* A malformed value must never stop the interpreter from printing the
            original message: drop the entry and carry on. */
         PyErr_Clear();
+        table->lines_skipped++;
         return;
     }
     PyObject *key_obj = PyUnicode_FromString(key);
     if (key_obj == NULL) {
         Py_DECREF(value);
         PyErr_Clear();
+        table->lines_skipped++;
+        return;
+    }
+
+    if (strchr(key, MESSAGE_PATTERN_WILDCARD) == NULL) {
+        /* A literal message.  The first entry for a key wins, which is what the
+           scan this replaces did as well. */
+        if (PyDict_SetDefault(table->literals, key_obj, value) == NULL) {
+            PyErr_Clear();
+            table->lines_skipped++;
+        }
+        else {
+            table->entry_count++;
+        }
+        Py_DECREF(key_obj);
+        Py_DECREF(value);
         return;
     }
 
@@ -1199,129 +1652,377 @@ message_table_add(MessageTable *table, char *key, char *hex,
     entry.value_utf8_size = 0;
     entry.star_count = 0;
 
-    if (strchr(key, MESSAGE_PATTERN_WILDCARD) != NULL) {
-        Py_ssize_t key_size = 0;
-        Py_ssize_t value_size = 0;
-        const char *key_utf8 = PyUnicode_AsUTF8AndSize(key_obj, &key_size);
-        const char *value_utf8 = (key_utf8 != NULL)
-            ? PyUnicode_AsUTF8AndSize(value, &value_size) : NULL;
-        if (key_utf8 == NULL || value_utf8 == NULL) {
+    Py_ssize_t key_size = 0;
+    Py_ssize_t value_size = 0;
+    const char *key_utf8 = PyUnicode_AsUTF8AndSize(key_obj, &key_size);
+    const char *value_utf8 = (key_utf8 != NULL)
+        ? PyUnicode_AsUTF8AndSize(value, &value_size) : NULL;
+    if (key_utf8 == NULL || value_utf8 == NULL) {
+        PyErr_Clear();
+        Py_DECREF(key_obj);
+        Py_DECREF(value);
+        table->lines_skipped++;
+        return;
+    }
+    size_t stars = pattern_star_count(key_utf8, (size_t)key_size);
+    if (stars > MESSAGE_PATTERN_MAX_STARS) {
+        Py_DECREF(key_obj);
+        Py_DECREF(value);
+        table->lines_skipped++;
+        return;
+    }
+    entry.key_utf8 = key_utf8;
+    entry.key_utf8_size = key_size;
+    entry.value_utf8 = value_utf8;
+    entry.value_utf8_size = value_size;
+    entry.star_count = stars;
+
+    if (table->pattern_count == table->pattern_capacity) {
+        Py_ssize_t bigger_capacity = table->pattern_capacity == 0
+            ? 64 : table->pattern_capacity * 2;
+        MessageEntry *bigger = PyMem_Realloc(
+            table->patterns,
+            (size_t)bigger_capacity * sizeof(MessageEntry));
+        if (bigger == NULL) {
+            /* Keep what we have, drop the rest. */
             PyErr_Clear();
             Py_DECREF(key_obj);
             Py_DECREF(value);
             return;
         }
-        size_t stars = pattern_star_count(key_utf8, (size_t)key_size);
-        if (stars > MESSAGE_PATTERN_MAX_STARS) {
-            Py_DECREF(key_obj);
-            Py_DECREF(value);
-            return;
-        }
-        entry.key_utf8 = key_utf8;
-        entry.key_utf8_size = key_size;
-        entry.value_utf8 = value_utf8;
-        entry.value_utf8_size = value_size;
-        entry.star_count = stars;
+        table->patterns = bigger;
+        table->pattern_capacity = bigger_capacity;
     }
-
-    if (table->count == *capacity) {
-        Py_ssize_t bigger_capacity = *capacity * 2;
-        MessageEntry *bigger = PyMem_Realloc(
-            table->entries, (size_t)bigger_capacity * sizeof(MessageEntry));
-        if (bigger == NULL) {
-            /* Keep what we have, drop the rest. */
-            Py_DECREF(key_obj);
-            Py_DECREF(value);
-            return;
-        }
-        table->entries = bigger;
-        *capacity = bigger_capacity;
-    }
-    table->entries[table->count] = entry;
-    table->count++;
-    if (entry.star_count != 0) {
-        table->pattern_count++;
-    }
+    table->patterns[table->pattern_count] = entry;
+    table->pattern_count++;
+    table->entry_count++;
 }
 
-static MessageTable *
-message_table_load(void)
+/*
+ * A small buffered reader over a FILE *.
+ *
+ * Bytes are read a chunk at a time and handed out one by one, which is what
+ * lets the line reader work on counts rather than on C strings: fgets() stops
+ * at a NUL byte, so a line holding one would come back cut in half without
+ * anybody noticing, and a line longer than the buffer would come back as two
+ * lines that each look complete.
+ */
+typedef struct {
+    FILE *fp;
+    char chunk[4096];
+    size_t size;                /* bytes valid in chunk */
+    size_t position;
+} TableReader;
+
+static void
+table_reader_init(TableReader *reader, FILE *fp)
 {
-    PyObject *path = message_table_path();
-    if (path == NULL) {
-        return NULL;
+    reader->fp = fp;
+    reader->size = 0;
+    reader->position = 0;
+}
+
+/* The next byte, or -1 at end of file. */
+static int
+table_reader_next(TableReader *reader)
+{
+    if (reader->position == reader->size) {
+        size_t got = fread(reader->chunk, 1, sizeof(reader->chunk),
+                           reader->fp);
+        if (got == 0) {
+            return -1;
+        }
+        reader->size = got;
+        reader->position = 0;
+    }
+    return (unsigned char)reader->chunk[reader->position++];
+}
+
+/*
+ * One line, without its terminator, in a buffer that grows as needed and always
+ * ends with a NUL past the bytes it holds.  `length` is the number of bytes
+ * handed out, which is what the splitter works from.
+ */
+typedef struct {
+    char *data;
+    size_t capacity;
+    size_t length;
+} TableLine;
+
+static int
+table_line_init(TableLine *line)
+{
+    line->capacity = 256;
+    line->length = 0;
+    line->data = PyMem_Malloc(line->capacity);
+    if (line->data == NULL) {
+        PyErr_NoMemory();
+        return -1;
+    }
+    return 0;
+}
+
+static void
+table_line_free(TableLine *line)
+{
+    PyMem_Free(line->data);
+    line->data = NULL;
+    line->capacity = 0;
+    line->length = 0;
+}
+
+/* Make room for `needed` bytes including the terminating NUL. */
+static int
+table_line_reserve(TableLine *line, size_t needed)
+{
+    if (needed <= line->capacity) {
+        return 0;
+    }
+    size_t capacity = line->capacity;
+    while (capacity < needed) {
+        capacity *= 2;
+    }
+    char *bigger = PyMem_Realloc(line->data, capacity);
+    if (bigger == NULL) {
+        PyErr_NoMemory();
+        return -1;
+    }
+    line->data = bigger;
+    line->capacity = capacity;
+    return 0;
+}
+
+/*
+ * Read one line into `line`.  Returns 1 for a line, 0 at end of file and -1
+ * when the buffer could not grow.
+ *
+ * A line longer than MESSAGE_TABLE_MAX_LINE is not stored: the rest of it is
+ * consumed so the next line starts where it should, *too_long is set, and the
+ * caller skips it as a whole.  Truncating it instead would hand the splitter a
+ * line that looks complete and quietly replace a message with the first half of
+ * a replacement nobody wrote.
+ */
+static int
+table_read_line(TableReader *reader, TableLine *line, int *too_long)
+{
+    *too_long = 0;
+    line->length = 0;
+    int any = 0;
+
+    for (;;) {
+        int ch = table_reader_next(reader);
+        if (ch < 0) {
+            break;                  /* end of file */
+        }
+        any = 1;
+        if (ch == '\n') {
+            break;
+        }
+        if (line->length >= MESSAGE_TABLE_MAX_LINE) {
+            *too_long = 1;          /* swallow the rest of this line */
+            continue;
+        }
+        if (table_line_reserve(line, line->length + 2) < 0) {
+            return -1;
+        }
+        line->data[line->length++] = (char)ch;
     }
 
-    FILE *fp = message_table_open(path);
-    if (fp == NULL) {
-        /* A missing table is a normal configuration, not an error: give up
-           quietly and remember it so we do not retry on every exception. */
-        PyErr_Clear();
-        Py_DECREF(path);
-        message_table_failed = 1;
-        return NULL;
+    if (!any) {
+        return 0;
     }
+    if (table_line_reserve(line, line->length + 1) < 0) {
+        return -1;
+    }
+    line->data[line->length] = '\0';
+    return 1;
+}
 
-    Py_ssize_t capacity = 32;
-    MessageTable *table = PyMem_Malloc(sizeof(MessageTable));
+/*
+ * Read the whole table from an open file into a fresh MessageTable.
+ */
+static MessageTable *
+message_table_read(FILE *fp)
+{
+    MessageTable *table = PyMem_Calloc(1, sizeof(MessageTable));
     if (table == NULL) {
-        fclose(fp);
-        Py_DECREF(path);
         PyErr_NoMemory();
         return NULL;
     }
-    table->entries = PyMem_Malloc((size_t)capacity * sizeof(MessageEntry));
-    if (table->entries == NULL) {
+    table->literals = PyDict_New();
+    if (table->literals == NULL) {
         PyMem_Free(table);
-        fclose(fp);
-        Py_DECREF(path);
-        PyErr_NoMemory();
         return NULL;
     }
-    table->count = 0;
-    table->pattern_count = 0;
 
-    char line[MESSAGE_TABLE_MAX_LINE];
-    while (fgets(line, (int)sizeof(line), fp) != NULL) {
+    TableReader reader;
+    table_reader_init(&reader, fp);
+    TableLine line;
+    if (table_line_init(&line) < 0) {
+        Py_DECREF(table->literals);
+        PyMem_Free(table);
+        return NULL;
+    }
+
+    int too_long = 0;
+    int status = 0;
+    while ((status = table_read_line(&reader, &line, &too_long)) > 0) {
+        if (too_long) {
+            table->lines_too_long++;
+            continue;
+        }
         char *key = NULL;
         char *hex = NULL;
-        if (table_split_line(line, &key, &hex) != 1) {
-            continue;             /* blank, comment or malformed: skip it */
+        int verdict = table_split_line(line.data, line.length, &key, &hex);
+        if (verdict == 0) {
+            continue;               /* blank or a comment */
         }
-        message_table_add(table, key, hex, &capacity);
+        if (verdict < 0) {
+            table->lines_skipped++;
+            PyErr_Clear();
+            continue;
+        }
+        if (table->entry_count >= MESSAGE_TABLE_MAX_ENTRIES) {
+            table->lines_skipped++;
+            continue;
+        }
+        message_table_add(table, key, hex);
+    }
+    if (status < 0) {
+        /* Out of memory while reading a line: keep what was read. */
+        PyErr_Clear();
     }
 
-    fclose(fp);
-    Py_DECREF(path);
+    table_line_free(&line);
     return table;
 }
 
-static MessageTable *
-message_table_get(void)
+/*
+ * Build a table from the first candidate that can be read.
+ *
+ * Returns a new capsule holding the table, or NULL when no candidate holds a
+ * readable table (which is a normal configuration) or when reading one failed.
+ * Nothing is remembered on failure: a table that appears later is picked up by
+ * the next lookup.
+ */
+static PyObject *
+message_table_build(void)
 {
-    if (message_table != NULL) {
-        return message_table;
+    for (int source = 0; source < (int)MESSAGE_TABLE_SOURCE_COUNT; source++) {
+        if (!message_table_candidate_wanted((MessageTableSource)source)) {
+            PyErr_Clear();
+            continue;
+        }
+        PyObject *path = message_table_candidate((MessageTableSource)source);
+        if (path == NULL) {
+            PyErr_Clear();
+            continue;
+        }
+        FILE *fp = message_table_open(path);
+        if (fp == NULL) {
+            PyErr_Clear();
+            Py_DECREF(path);
+            continue;               /* not readable: try the next candidate */
+        }
+        MessageTable *table = NULL;
+        if (message_table_size_ok(fp)) {
+            table = message_table_read(fp);
+        }
+        fclose(fp);
+        Py_DECREF(path);
+        if (table == NULL) {
+            PyErr_Clear();
+            continue;
+        }
+        if (table->lines_skipped > 0 || table->lines_too_long > 0) {
+            /* Say so once, and only where a diagnostic is expected anyway: a
+               silently dropped entry is the one failure mode that is otherwise
+               impossible to see from the outside. */
+            if (message_table_sys_flag("dev_mode")) {
+                PySys_WriteStderr(
+                    "message table: %zd malformed line(s) and %zd line(s) over "
+                    "%d bytes ignored\n",
+                    table->lines_skipped, table->lines_too_long,
+                    (int)MESSAGE_TABLE_MAX_LINE);
+            }
+            PyErr_Clear();
+        }
+        PyObject *capsule = PyCapsule_New(table, MESSAGE_TABLE_CAPSULE_NAME,
+                                          message_table_capsule_free);
+        if (capsule == NULL) {
+            PyErr_Clear();
+            message_table_free(table);
+            continue;
+        }
+        return capsule;
     }
-    if (message_table_failed) {
-        return NULL;
-    }
-    message_table = message_table_load();
-    if (message_table == NULL) {
-        message_table_failed = 1;
-    }
-    return message_table;
+    PyErr_Clear();
+    return NULL;
 }
 
-/* Defined next to the display proxy, further down. */
-static void display_proxies_clear(void);
+/*
+ * The table of the current interpreter, as a capsule the caller has to keep
+ * alive for as long as it uses the table.
+ *
+ * Returns a new reference, or NULL when there is no table to use.  Building it
+ * twice under a race costs one wasted table: the two threads both publish with
+ * PyDict_SetDefaultRef(), one wins, and the loser drops its own copy.
+ */
+static PyObject *
+message_table_acquire(void)
+{
+    PyObject *dict = message_table_interp_dict();
+    if (dict == NULL) {
+        PyErr_Clear();
+        return NULL;
+    }
 
-/* Called from _Py_Finalize() (see attach.patch). */
+    PyObject *capsule = NULL;
+    if (PyDict_GetItemStringRef(dict, MESSAGE_TABLE_STATE_KEY, &capsule) < 0) {
+        PyErr_Clear();
+        return NULL;
+    }
+    if (capsule != NULL) {
+        return capsule;
+    }
+
+    PyObject *fresh = message_table_build();
+    if (fresh == NULL) {
+        return NULL;
+    }
+    PyObject *key = PyUnicode_FromString(MESSAGE_TABLE_STATE_KEY);
+    if (key == NULL) {
+        PyErr_Clear();
+        Py_DECREF(fresh);
+        return NULL;
+    }
+    PyObject *published = NULL;
+    if (PyDict_SetDefaultRef(dict, key, fresh, &published) < 0) {
+        PyErr_Clear();
+        Py_DECREF(key);
+        Py_DECREF(fresh);
+        return NULL;
+    }
+    Py_DECREF(key);
+    Py_DECREF(fresh);               /* the dict holds it now */
+    return published;
+}
+
+/* Drop this interpreter's table and proxy cache. */
 void
 _PyMessageTable_Fini(void)
 {
-    message_table_clear();
-    display_proxies_clear();
-    message_table_failed = 0;
+    PyObject *dict = message_table_interp_dict();
+    if (dict == NULL) {
+        PyErr_Clear();
+        return;
+    }
+    if (PyDict_DelItemString(dict, MESSAGE_TABLE_STATE_KEY) < 0) {
+        PyErr_Clear();
+    }
+    if (PyDict_DelItemString(dict, MESSAGE_TABLE_PROXIES_KEY) < 0) {
+        PyErr_Clear();
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -1600,17 +2301,15 @@ copy_shows_replacement(PyObject *value, PyObject *copy, PyObject *replacement)
  * type that is displayed, and a program is free to build exception classes at
  * run time (a factory that calls type(), a plugin system), so the cache gets a
  * ceiling: past it a proxy is still built and used, it is just not kept.
+ *
+ * The cache is a list of (weak reference to base, weak reference to proxy)
+ * pairs living in the interpreter's dict.  Weak on purpose: a proxy is a
+ * subclass of the base, so a strong entry would keep every exception class that
+ * was ever displayed alive until the interpreter ends.  With weak references a
+ * class built at run time is collected as soon as the program drops it, and the
+ * dead pair is simply skipped (and eventually outnumbered) by later lookups.
  */
 #define MESSAGE_PROXY_MAX_CACHED 64
-
-typedef struct {
-    PyObject *base;             /* the type the proxy stands in for */
-    PyObject *proxy;            /* its subclass, holding __str__ */
-} DisplayProxy;
-
-static DisplayProxy *display_proxies = NULL;
-static Py_ssize_t display_proxy_count = 0;
-static Py_ssize_t display_proxy_capacity = 0;
 
 /*
  * __str__ of a display proxy: the replacement the copy carries, or the empty
@@ -1634,17 +2333,104 @@ static PyMethodDef display_proxy_str_method = {
     "__str__", display_proxy_str, METH_NOARGS, NULL,
 };
 
-static void
-display_proxies_clear(void)
+/* The current interpreter's proxy list, created on first use. */
+static PyObject *
+display_proxies_acquire(void)
 {
-    for (Py_ssize_t i = 0; i < display_proxy_count; i++) {
-        Py_DECREF(display_proxies[i].base);
-        Py_DECREF(display_proxies[i].proxy);
+    PyObject *dict = message_table_interp_dict();
+    if (dict == NULL) {
+        PyErr_Clear();
+        return NULL;
     }
-    PyMem_Free(display_proxies);
-    display_proxies = NULL;
-    display_proxy_count = 0;
-    display_proxy_capacity = 0;
+    PyObject *list = NULL;
+    if (PyDict_GetItemStringRef(dict, MESSAGE_TABLE_PROXIES_KEY, &list) < 0) {
+        PyErr_Clear();
+        return NULL;
+    }
+    if (list != NULL) {
+        return list;
+    }
+    PyObject *fresh = PyList_New(0);
+    if (fresh == NULL) {
+        PyErr_Clear();
+        return NULL;
+    }
+    PyObject *key = PyUnicode_FromString(MESSAGE_TABLE_PROXIES_KEY);
+    if (key == NULL) {
+        PyErr_Clear();
+        Py_DECREF(fresh);
+        return NULL;
+    }
+    PyObject *published = NULL;
+    if (PyDict_SetDefaultRef(dict, key, fresh, &published) < 0) {
+        PyErr_Clear();
+        Py_DECREF(key);
+        Py_DECREF(fresh);
+        return NULL;
+    }
+    Py_DECREF(key);
+    Py_DECREF(fresh);               /* the dict holds it now */
+    return published;
+}
+
+/* The cached proxy for `base`, or NULL.  Returns a new reference. */
+static PyObject *
+display_proxy_cached(PyObject *list, PyObject *base)
+{
+    Py_ssize_t size = PyList_GET_SIZE(list);
+    for (Py_ssize_t i = 0; i < size; i++) {
+        PyObject *item = PyList_GetItemRef(list, i);
+        if (item == NULL) {
+            PyErr_Clear();
+            return NULL;
+        }
+        if (!PyTuple_Check(item) || PyTuple_GET_SIZE(item) != 2) {
+            Py_DECREF(item);
+            continue;
+        }
+        PyObject *cached_base = NULL;
+        if (PyWeakref_GetRef(PyTuple_GET_ITEM(item, 0), &cached_base) == 1) {
+            if (cached_base == base) {
+                PyObject *proxy = NULL;
+                if (PyWeakref_GetRef(PyTuple_GET_ITEM(item, 1), &proxy) == 1) {
+                    Py_DECREF(cached_base);
+                    Py_DECREF(item);
+                    return proxy;
+                }
+                PyErr_Clear();
+            }
+            Py_XDECREF(cached_base);
+        }
+        else {
+            PyErr_Clear();          /* the base is gone: a dead entry */
+        }
+        Py_DECREF(item);
+    }
+    return NULL;
+}
+
+/* Remember `proxy` as the proxy of `base`, unless the cache is full. */
+static void
+display_proxy_remember(PyObject *list, PyObject *base, PyObject *proxy)
+{
+    if (PyList_GET_SIZE(list) >= MESSAGE_PROXY_MAX_CACHED) {
+        return;
+    }
+    PyObject *base_ref = PyWeakref_NewRef(base, NULL);
+    PyObject *proxy_ref = PyWeakref_NewRef(proxy, NULL);
+    PyObject *item = (base_ref != NULL && proxy_ref != NULL)
+        ? PyTuple_Pack(2, base_ref, proxy_ref) : NULL;
+    if (item == NULL) {
+        PyErr_Clear();
+    }
+    else if (PyList_Append(list, item) < 0) {
+        /* Two threads can build the same proxy at once; the extra pair is
+           harmless, the lookup takes the first live one. */
+        PyErr_Clear();
+    }
+    Py_XDECREF(item);
+    Py_XDECREF(base_ref);
+    Py_XDECREF(proxy_ref);
 }
 
 /*
@@ -1658,10 +2444,16 @@ display_proxies_clear(void)
 static PyObject *
 display_proxy_class(PyObject *base)
 {
-    for (Py_ssize_t i = 0; i < display_proxy_count; i++) {
-        if (display_proxies[i].base == base) {
-            return Py_NewRef(display_proxies[i].proxy);
+    PyObject *list = display_proxies_acquire();
+    if (list != NULL) {
+        PyObject *cached = display_proxy_cached(list, base);
+        if (cached != NULL) {
+            Py_DECREF(list);
+            return cached;
         }
+    }
+    else {
+        PyErr_Clear();              /* no interpreter dict: build, do not keep */
     }
 
     PyObject *name = PyObject_GetAttrString(base, "__name__");
@@ -1695,33 +2487,15 @@ display_proxy_class(PyObject *base)
         goto done;
     }
 
-    /* Cache it.  Running out of memory, or reaching the ceiling, is not worth
-       failing over: the proxy is usable as it is, it just will not be reused. */
-    if (display_proxy_count < MESSAGE_PROXY_MAX_CACHED) {
-        if (display_proxy_count == display_proxy_capacity) {
-            Py_ssize_t capacity = display_proxy_capacity == 0
-                ? 8 : display_proxy_capacity * 2;
-            if (capacity > MESSAGE_PROXY_MAX_CACHED) {
-                capacity = MESSAGE_PROXY_MAX_CACHED;
-            }
-            DisplayProxy *bigger = PyMem_Realloc(
-                display_proxies, (size_t)capacity * sizeof(DisplayProxy));
-            if (bigger == NULL) {
-                PyErr_Clear();
-            }
-            else {
-                display_proxies = bigger;
-                display_proxy_capacity = capacity;
-            }
-        }
-        if (display_proxy_count < display_proxy_capacity) {
-            display_proxies[display_proxy_count].base = Py_NewRef(base);
-            display_proxies[display_proxy_count].proxy = Py_NewRef(proxy);
-            display_proxy_count++;
-        }
+    /* Remember it.  Running out of memory, or reaching the ceiling, is not
+       worth failing over: the proxy is usable as it is, it just will not be
+       reused. */
+    if (list != NULL) {
+        display_proxy_remember(list, base, proxy);
     }
 
 done:
+    Py_XDECREF(list);
     Py_XDECREF(name);
     Py_XDECREF(qualname);
     Py_XDECREF(module);
@@ -1792,12 +2566,39 @@ exception_with_display(PyObject *value, PyObject *replacement)
  *
  * Returns a NEW reference to the rewritten copy, or NULL when this exception
  * cannot be rewritten, either because the copy cannot be built or because it
- * would not display the replacement.  SyntaxError keeps its message in .msg
- * and its location in the fields listed above, so both are updated there.
+ * would not display the replacement.
+ *
+ * Which route is taken depends on where the displayed text comes from:
+ *
+ *   - tp_str is BaseException's, so the display is args[0] (or the repr of the
+ *     whole argument tuple when there is more than one argument, which is why
+ *     that case is left alone).  Writing the replacement into args[0] is enough,
+ *     and the copy is checked to display exactly the replacement before it is
+ *     accepted.
+ *   - tp_str is the type's own, so the display is whatever that __str__
+ *     computes.  Two things follow.  The equality check cannot be the gate: a
+ *     __str__ that answers differently on every call would pass the check and
+ *     then print something else the table never asked for, so the check is not
+ *     what decides here.  And the replacement cannot be carried by args[0],
+ *     because that is not what gets displayed: a display proxy carries it.
+ *     SyntaxError is the exception to both: it appends its location, so its own
+ *     path is used and the display only has to start with the new message.
  */
 static PyObject *
 exception_with_message(PyObject *value, PyObject *replacement)
 {
+    int custom_str = Py_TYPE(value)->tp_str
+        != Py_TYPE(PyExc_BaseException)->tp_str;
+    int syntax_error = PyObject_TypeCheck(value,
+                                          (PyTypeObject *)PyExc_SyntaxError);
+
+    if (custom_str && !syntax_error) {
+        if (!message_is_whole_display(value)) {
+            return NULL;
+        }
+        return exception_with_display(value, replacement);
+    }
+
     PyObject *copy = copy_exception(value);
     if (copy == NULL) {
         return NULL;
@@ -1833,26 +2634,15 @@ exception_with_message(PyObject *value, PyObject *replacement)
     }
     Py_DECREF(newargs);
 
-    if (PyObject_TypeCheck(value, (PyTypeObject *)PyExc_SyntaxError)
-        && !set_syntax_error_message(value, copy, replacement)) {
+    if (syntax_error && !set_syntax_error_message(value, copy, replacement)) {
         Py_DECREF(copy);
         return NULL;
     }
 
     if (!copy_shows_replacement(value, copy, replacement)) {
-        /* This type does not render args[0] (OSError, UnicodeDecodeError,
-           KeyError, a type with its own __str__), so the copy built above
-           shows something else: a display proxy carries the replacement
-           instead.  SyntaxError is left out even there, because its own path
-           above keeps the location that a proxy would drop. */
         Py_DECREF(copy);
-        if (PyObject_TypeCheck(value, (PyTypeObject *)PyExc_SyntaxError)
-            || !message_is_whole_display(value)) {
-            return NULL;
-        }
-        return exception_with_display(value, replacement);
+        return NULL;
     }
-
     return copy;
 }
 
@@ -1863,27 +2653,19 @@ exception_with_message(PyObject *value, PyObject *replacement)
 /*
  * The replacement of a literal entry whose key equals `text`, or NULL.
  *
- * The comparison stays on the str objects (PyUnicode_Compare), so a literal
- * entry keeps matching exactly what it matched before patterns existed.
+ * The literals live in a dict, so this is one hashed lookup instead of a scan
+ * over every literal entry of the table; the comparison itself is still str
+ * equality, which is what a literal key has always meant.
  */
 static PyObject *
 literal_replacement(MessageTable *table, PyObject *text)
 {
-    for (Py_ssize_t i = 0; i < table->count; i++) {
-        MessageEntry *entry = &table->entries[i];
-        if (entry->star_count != 0) {
-            continue;               /* a pattern, not a literal message */
-        }
-        int cmp = PyUnicode_Compare(text, entry->key);
-        if (cmp < 0) {
-            PyErr_Clear();          /* comparison failure: no match */
-            continue;
-        }
-        if (cmp == 0) {
-            return Py_NewRef(entry->value);
-        }
+    PyObject *value = NULL;
+    if (PyDict_GetItemRef(table->literals, text, &value) < 0) {
+        PyErr_Clear();
+        return NULL;
     }
-    return NULL;
+    return value;                   /* new reference, or NULL for a miss */
 }
 
 /*
@@ -1892,6 +2674,9 @@ literal_replacement(MessageTable *table, PyObject *text)
  * Patterns are tried only after every literal key has failed, and the winner
  * is the matching pattern with the fewest wildcards; an equal count is decided
  * by position in the table, which is the order this scan visits entries in.
+ *
+ * Every pattern of a lookup shares one budget, so a table full of patterns that
+ * backtrack cannot add up to minutes of work for a single traceback.
  */
 static PyObject *
 pattern_replacement(MessageTable *table, PyObject *text)
@@ -1910,16 +2695,17 @@ pattern_replacement(MessageTable *table, PyObject *text)
         return NULL;
     }
 
+    size_t budget = MESSAGE_PATTERN_CALL_BUDGET;
     MessageEntry *winner = NULL;
     size_t fewest = (size_t)-1;
-    for (Py_ssize_t i = 0; i < table->count; i++) {
-        MessageEntry *entry = &table->entries[i];
-        if (entry->star_count == 0 || entry->star_count >= fewest) {
+    for (Py_ssize_t i = 0; i < table->pattern_count; i++) {
+        MessageEntry *entry = &table->patterns[i];
+        if (entry->star_count >= fewest) {
             continue;               /* cannot beat the pattern that matched */
         }
         if (!pattern_match(entry->key_utf8, (size_t)entry->key_utf8_size,
                            text_utf8, (size_t)text_size,
-                           entry->star_count, NULL)) {
+                           entry->star_count, &budget, NULL)) {
             continue;
         }
         winner = entry;
@@ -1934,7 +2720,7 @@ pattern_replacement(MessageTable *table, PyObject *text)
     size_t captures[2 * MESSAGE_PATTERN_MAX_STARS];
     if (!pattern_match(winner->key_utf8, (size_t)winner->key_utf8_size,
                        text_utf8, (size_t)text_size, winner->star_count,
-                       captures)) {
+                       NULL, captures)) {
         return NULL;
     }
 
@@ -1947,9 +2733,13 @@ pattern_replacement(MessageTable *table, PyObject *text)
            original message instead of inventing text. */
         return NULL;
     }
+    /* The expansion is a slice of a table line that was decoded as UTF-8 before
+       it was hex encoded, so it decodes strictly here as well; anything else
+       would be a bug in the engine, and dropping the rewrite is the safe end of
+       that. */
     PyObject *result = PyUnicode_DecodeUTF8(expanded,
                                             (Py_ssize_t)expanded_size,
-                                            "replace");
+                                            "strict");
     free(expanded);
     if (result == NULL) {
         PyErr_Clear();
@@ -1967,6 +2757,12 @@ pattern_replacement(MessageTable *table, PyObject *text)
  * Returns a NEW reference to a copy of `value` carrying the replacement
  * message, or NULL when nothing was replaced.  This replaces the 3.10 entry
  * point, which took the type/value/tb triple.
+ *
+ * The error indicator is saved on the way in and restored on the way out.  This
+ * runs while an exception is being displayed and the caller owns whatever the
+ * indicator holds, so a lookup that failed on the way -- an unreadable table, a
+ * message without a UTF-8 form, a class that refuses to be subclassed -- must
+ * neither report its own failure nor destroy the caller's pending exception.
  */
 PyObject *
 _PyErr_Message_Replace(PyObject *value)
@@ -1975,27 +2771,36 @@ _PyErr_Message_Replace(PyObject *value)
         return NULL;
     }
 
-    MessageTable *table = message_table_get();
-    if (table == NULL) {
-        return NULL;
+    PyObject *saved = PyErr_GetRaisedException();   /* clears the indicator */
+    PyObject *result = NULL;
+    PyObject *capsule = message_table_acquire();
+    MessageTable *table = NULL;
+    if (capsule != NULL) {
+        table = PyCapsule_GetPointer(capsule, MESSAGE_TABLE_CAPSULE_NAME);
+        if (table == NULL) {
+            PyErr_Clear();
+        }
     }
 
-    PyObject *text = replaceable_message(value);
-    if (text == NULL) {
-        return NULL;
+    if (table != NULL) {
+        PyObject *text = replaceable_message(value);
+        if (text != NULL) {
+            PyObject *replacement = literal_replacement(table, text);
+            if (replacement == NULL) {
+                replacement = pattern_replacement(table, text);
+            }
+            Py_DECREF(text);
+            if (replacement != NULL) {
+                result = exception_with_message(value, replacement);
+                Py_DECREF(replacement);
+            }
+        }
     }
-
-    PyObject *replacement = literal_replacement(table, text);
-    if (replacement == NULL) {
-        replacement = pattern_replacement(table, text);
+    Py_XDECREF(capsule);
+    if (result == NULL) {
+        PyErr_Clear();
     }
-    Py_DECREF(text);
-    if (replacement == NULL) {
-        return NULL;
-    }
-
-    PyObject *result = exception_with_message(value, replacement);
-    Py_DECREF(replacement);
+    PyErr_SetRaisedException(saved);    /* steals; NULL means "none" */
     return result;
 }
 
@@ -2003,10 +2808,22 @@ _PyErr_Message_Replace(PyObject *value)
 Py_ssize_t
 _PyMessageTable_Reload(void)
 {
-    message_table_clear();
-    message_table_failed = 0;
-    MessageTable *table = message_table_get();
-    return table == NULL ? 0 : table->count;
+    _PyMessageTable_Fini();
+    PyObject *capsule = message_table_acquire();
+    if (capsule == NULL) {
+        PyErr_Clear();
+        return 0;
+    }
+    MessageTable *table = PyCapsule_GetPointer(capsule,
+                                               MESSAGE_TABLE_CAPSULE_NAME);
+    if (table == NULL) {
+        PyErr_Clear();
+        Py_DECREF(capsule);
+        return 0;
+    }
+    Py_ssize_t count = table->entry_count;
+    Py_DECREF(capsule);
+    return count;
 }
 
 #endif /* !MESSAGE_TABLE_NO_PYTHON */

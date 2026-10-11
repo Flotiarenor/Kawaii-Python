@@ -1,10 +1,10 @@
 /*
  * Message replacement table — public declarations for CPython 3.11+.
  *
- * Included from Include/cpython/unicodeobject.h (see attach.patch), which is a
- * pragmatic home for it: that header is pulled in by Python.h and already
- * carries the other Unicode-facing C API.  Moving it to Include/internal/ is
- * the cleaner long-term option if this ever leaves a private fork.
+ * Included from Include/cpython/unicodeobject.h, which is a pragmatic home for
+ * it: that header is pulled in by Python.h and already carries the other
+ * Unicode-facing C API.  Moving it to Include/internal/ is the cleaner
+ * long-term option if this ever leaves a private fork.
  */
 
 #ifndef Py_MESSAGE_TABLE_H
@@ -27,15 +27,23 @@ extern "C" {
  * multi-argument tuple, are left alone.  Callers must treat NULL as "use the
  * original".
  *
+ * The error indicator is left exactly as the call found it: the function runs
+ * while an exception is being displayed, and the caller's pending exception is
+ * none of its business.  In particular it sets no exception of its own when it
+ * decides not to replace anything.
+ *
  * Implemented in Objects/message_table.c.
  */
 PyAPI_FUNC(PyObject *) _PyErr_Message_Replace(PyObject *value);
 
-/* Reload the cached table from disk.  Returns the number of entries loaded
-   (0 when no table is configured or readable).  Intended for tests. */
+/* Drop the table and the display-proxy cache of the current interpreter and
+   load them again.  Returns the number of entries loaded (0 when no table is
+   configured or readable).  Intended for tests. */
 PyAPI_FUNC(Py_ssize_t) _PyMessageTable_Reload(void);
 
-/* Release the cached table.  Called from _Py_Finalize(). */
+/* Drop the table and the display-proxy cache of the current interpreter.  Called
+   from _Py_Finalize(); the caches live in the interpreter's own dictionary, so
+   this only makes the release point explicit. */
 PyAPI_FUNC(void) _PyMessageTable_Fini(void);
 
 #ifdef __cplusplus
