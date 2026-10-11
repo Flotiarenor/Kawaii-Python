@@ -62,7 +62,7 @@ pattern above rendered with `int` and `foo` substituted into `%1` and `%2`.
 
 ## Where it differs from upstream
 
-Six upstream files touched, two added:
+Ten upstream files touched, four added:
 
 | File | Change |
 | --- | --- |
@@ -70,8 +70,11 @@ Six upstream files touched, two added:
 | `Python/pylifecycle.c` | release the cached table in `_Py_Finalize()` (line 2401) |
 | `Include/cpython/unicodeobject.h` | include the new header, last line of the file |
 | `Makefile.pre.in`, `PCbuild/pythoncore.vcxproj`, `PCbuild/_freeze_module.vcxproj` | build the new source |
-| **added** `Objects/message_table.c` | table loading, hex decoding, lookup, rewriting, and the "can this message be replaced" decision |
+| `Tools/msi/common_en-US.wxl_template`, `Tools/msi/msi.targets`, `Tools/msi/exe/exe_en-US.wxl_template`, `Tools/msi/freethreaded/freethreaded_en-US.wxl_template` | the installer's identity strings: display name `Kawaii-Python 3.15.0 (64-bit)`, publisher `Kawaii-Python`, and `SupportUrl` pointing at this repository, via a marker-free `{{PyVersion}}` token |
+| **added** `Objects/message_table.c` | table loading, hex decoding, lookup, rewriting, the display proxy, and the "can this message be replaced" decision |
 | **added** `Include/message_table.h` | declarations |
+| **added** `lookup-table.txt` | the shipped table — the deliverable itself |
+| **added** `Lib/test/test_message_table.py` | this fork's tests for the table, the gate, the display proxy and the REPL entry point |
 
 `_PyErr_Display()` is the single funnel every traceback goes through — the
 REPL, `PyErr_Print`/`sys.excepthook`, `sys.__excepthook__`, and the C fallback

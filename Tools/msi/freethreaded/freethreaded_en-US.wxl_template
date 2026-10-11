@@ -4,5 +4,5 @@
     <String Id="ShortDescriptor">freethreaded</String>
     <String Id="ShortcutName">Python {{ShortVersion}} ({{Bitness}}, freethreaded)</String>
     <String Id="ShortcutDescription">Launches the !(loc.ProductName) freethreaded interpreter.</String>
-    <String Id="SupportUrl">https://www.python.org/</String>
+    <String Id="SupportUrl">https://github.com/Flotiarenor/Kawaii-Python</String>
 </WixLocalization>

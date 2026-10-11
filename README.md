@@ -190,5 +190,11 @@ Python itself belongs [upstream](https://github.com/python/cpython/issues).
 
 ## License
 
-PSF License Version 2, unchanged. See [LICENSE](LICENSE) for the terms and the history of this
-software; the CPython copyright and license have not been modified by this fork.
+Both upstream CPython and this fork's changes are distributed under the **PSF License Version 2**:
+`LICENSE` is unchanged, and the `LICENSE.txt` inside the installer is that license plus the
+licenses of the bundled third-party libraries. See [LICENSE](LICENSE) for the terms and the history
+of this software; the CPython copyright and license have not been modified by this fork.
+
+This fork's own changes (listed in [FORK-NOTICE.md](FORK-NOTICE.md)) are Copyright Flotiarenor and
+are offered under the same PSF-2.0 terms. "Python" is a trademark of the Python Software
+Foundation; this fork is not affiliated with, or endorsed by, the PSF.

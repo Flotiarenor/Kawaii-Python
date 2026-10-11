@@ -10,7 +10,7 @@
 
 - 这是**非官方**的 CPython 修改版，基线 v3.15.0，只有一个自加功能：异常信息可用外部文本表
   替换。上游的构建系统、标准库、测试套件、许可证一律未改。
-- 与上游的差异只有 8 个文件，改动前先认清边界：
+- 与上游的差异：上游文件改动 10 个，本 fork 新增 4 个，改动前先认清边界：
 
   | 文件 | 作用 |
   | --- | --- |
@@ -21,6 +21,8 @@
   | [Objects/message_table.c](Objects/message_table.c) | 表的加载、hex 解码、查找、改写、显示代理与"能否替换"的判定 |
   | lookup-table.txt（仓库根目录） | **交付物本体**：替换用的查询表，受版本控制、随仓库分发 |
   | [Makefile.pre.in](Makefile.pre.in)、[PCbuild/pythoncore.vcxproj](PCbuild/pythoncore.vcxproj)、[PCbuild/_freeze_module.vcxproj](PCbuild/_freeze_module.vcxproj) | 把新源文件编进 `pythoncore` |
+  | [Tools/msi/common_en-US.wxl_template](Tools/msi/common_en-US.wxl_template)、[Tools/msi/msi.targets](Tools/msi/msi.targets)、[Tools/msi/exe/exe_en-US.wxl_template](Tools/msi/exe/exe_en-US.wxl_template)、[Tools/msi/freethreaded/freethreaded_en-US.wxl_template](Tools/msi/freethreaded/freethreaded_en-US.wxl_template) | 安装包的身份字符串：显示名 `Kawaii-Python 3.15.0 (64-bit)`、发布者 `Kawaii-Python`、`SupportUrl` 指向本仓库（新增不带 `-test` 的 `{{PyVersion}}` 占位符） |
+  | [Lib/test/test_message_table.py](Lib/test/test_message_table.py) | 本 fork 自己的测试（表、闸门、显示代理、REPL 入口） |
 
 - 钩子选在 `_PyErr_Display()`：REPL、`PyErr_Print`、`sys.excepthook`、`sys.__excepthook__`
   与 `traceback` 模块不可用时的 C 回退都从这里出去，一处覆盖全部。**REPL 不走
@@ -274,8 +276,10 @@ fix(message-table): 修正 REPL 下不替换异常信息的情形
   文件在仓库里不存在，指向它的句子应当改掉。改这句话要动 C 头文件，按上面第 1 步必须真实
   构建一次，不要只为文案顺手改。
 - [docs/development.md](docs/development.md) 的安装包一节已按 v3.15.0 的真实构建回填（MSVC ARM64
-  工具集与 VSProcessesRunning 8006、临时的 `README.rst` 标记、`doc` 包依赖 Sphinx 输出、
-  `/p:OutputName` 不决定最终文件名）。仍未落地的是 `buildrelease.bat` 的 fork 副本，以及
-  安装包产品名/发布者仍是官方那两处，见该文件末尾的"已知未做"。
+  工具集与 VSProcessesRunning 8006、临时的 `README.rst` 标记、`doc` 包依赖 Sphinx 输出）。
+  两条已纠正：`/p:OutputName` **确实**决定 bundle 的最终名字（命令行全局属性优先于工程里的
+  `<OutputName>`，不带它就是 `python-3.15.0-amd64.exe`）；安装包的身份字符串已全部改为
+  Kawaii-Python（显示名、发布者、`SupportUrl`）。仍未落地的只剩 `buildrelease.bat` 的 fork
+  副本，见该文件末尾的"已知未做"。
 - 上游文件自带的 CJK 只出现在 `Lib/test/**` 的测试数据与 `Doc/**` 的示例里，属于既定内容，
   不要顺手"清理"。

@@ -170,5 +170,10 @@ Linux x64 有便携压缩包，见上方的下载表格。macOS 暂无产物，�
 
 ## 许可证
 
-PSF License Version 2，未改动。条款与这份软件的历史见 [LICENSE](LICENSE)；CPython 自身的
-版权与许可条款没有被本 fork 修改。
+上游 CPython 与本 fork 的改动都按 **PSF License Version 2** 分发：`LICENSE` 未改动，安装包里的
+`LICENSE.txt` 是它与捆绑的第三方许可的合集。条款与这份软件的历史见 [LICENSE](LICENSE)；CPython
+自身的版权与许可条款没有被本 fork 修改。
+
+本 fork 自己的改动（清单见 [FORK-NOTICE.md](FORK-NOTICE.md)）版权归 Flotiarenor，同样以
+PSF-2.0 提供。"Python" 是 Python Software Foundation 的商标，本 fork 与 PSF 无隶属关系，
+也未获其背书。

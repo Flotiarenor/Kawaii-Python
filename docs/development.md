@@ -142,9 +142,22 @@ providing a unique URI for this property"（
 `RELEASE_URI` 的 scheme **必须是 `http`**：改成 `https` 会让产物无法与官方版本互相升级
 （[buildrelease.bat:15-16](../Tools/msi/buildrelease.bat#L15-L16)）。
 
-安装程序的显示名来自安装包自己的本地化字符串，在 `Tools\msi\bundle\` 下的 `.wxl` 模板里。
-**本 fork 尚未改这一处**：当前产物在"应用和功能"里显示为 `Python 3.15.0-test (64-bit)`，
-发布者仍是 `Python Software Foundation`（见下方"已知未做"）。
+安装程序的身份字符串都来自安装包自己的本地化字符串。bundle 的名字取 `!(loc.FullProductName)`、
+发布者取 `!(loc.Manufacturer)`（[bundle.wxs:5-9](../Tools/msi/bundle/bundle.wxs#L5-L9)），
+它们由 [Tools/msi/common_en-US.wxl_template](../Tools/msi/common_en-US.wxl_template) 的模板生成，
+占位符在 [msi.targets:63](../Tools/msi/msi.targets#L63) 处替换。本 fork 改了三处：
+
+| 字符串 | 上游值 | 本 fork |
+| --- | --- | --- |
+| `FullProductName`（bundle 名 → "应用和功能"里的显示名） | `Python {{LongVersion}} ({{Bitness}})` → `Python 3.15.0-test (64-bit)` | `Kawaii-Python {{PyVersion}} ({{Bitness}})` → `Kawaii-Python 3.15.0 (64-bit)` |
+| `Manufacturer`（发布者） | `Python Software Foundation` | `Kawaii-Python` |
+| `ManufacturerSupportUrl` 与 [exe](../Tools/msi/exe/exe_en-US.wxl_template)、[freethreaded](../Tools/msi/freethreaded/freethreaded_en-US.wxl_template) 两个模板里的 `SupportUrl`（写进注册表的 `SupportUrl` 值） | `https://www.python.org/` | `https://github.com/Flotiarenor/Kawaii-Python` |
+
+其中 `{{PyVersion}}` 是为这次改动新增的占位符 → `$(PythonVersion)`：`{{LongVersion}}` 自带
+`-test` 标记（`PyTestExt`），直接用它会把标记带进显示名。安装目录与注册表**不受影响**，仍是
+`Python315-test` / `3.15-test`（与官方 3.15 隔离靠的就是这个标记）；`LICENSE.txt` 与二进制里的
+PSF 版权声明照旧保留。安装界面里的帮助链接（`docs.python.org`、`discuss.python.org`）仍指向上游
+文档与社区——那本来就是这份 Python 的文档。
 
 ### 交付物里的表
 
@@ -334,10 +347,14 @@ SyntaxError: invalid syntax     # 不生效
 v3.15.0 的产物（Windows 安装包与便携 zip、Linux 便携包）已构建并逐项验收，以下几条是明确的
 未完成项，不是遗漏：
 
-- **安装包的产品名与发布者仍是官方的**：在"应用和功能"里显示为
-  `Python 3.15.0-test (64-bit)`、发布者 `Python Software Foundation`。要改成 Kawaii-Python
-  得改 `Tools\msi\bundle\` 下的 `.wxl` 本地化模板，那会让与上游的差异文件从 8 个变成 9 个
-  （见 [FORK-NOTICE.md](../FORK-NOTICE.md) 的差异清单），需要先确认这个代价可以接受。
+- **安装包界面里的若干链接仍指向上游**：身份字符串（"应用和功能"里的显示名、发布者、注册表
+  里的 `SupportUrl`）已全部改成 Kawaii-Python，见上面"产物命名"一节；但
+  [bundle/Default.wxl](../Tools/msi/bundle/Default.wxl) 的帮助文案（`docs.python.org`、
+  `discuss.python.org`、python.org 的下载页）与
+  [bundle.wxs:10](../Tools/msi/bundle/bundle.wxs#L10) 的 `AboutUrl` 还是上游地址——它们指向的
+  本来就是这份 Python 的文档与社区，保留是有意的。另外 py launcher 列出的解释器名仍是
+  `Python 3.15-test (64-bit)`（`ShortcutName`），要改就得再动 `exe`、`doc`、`tcltk` 三个
+  `*_en-US.wxl_template`。
 - **便携包不含 tkinter 之外的 Tcl/Tk 运行时资源校验**：Linux 包里的 `_tkinter` 已编入，
   但容器内的 Tcl/Tk 视发行版而定；Windows 包的 `tcl/` 目录由 `PC/layout` 放入，未单独验证
   图形界面启动。
