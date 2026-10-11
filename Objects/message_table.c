@@ -6,27 +6,71 @@
  *
  *   1. 3.11 replaced the type/value/traceback triple with a single exception
  *      instance, so the hook no longer rebuilds a value tuple.
- *   2. Not every exception derives its displayed text from args[0].  OSError,
- *      UnicodeDecodeError, KeyError and types with a custom __str__ build the
- *      message from dedicated fields, and rewriting args there would silently
- *      change nothing.  Those instances are detected and skipped.
+ *   2. Not every exception derives its displayed text from args[0].  OSError
+ *      and UnicodeDecodeError build the message from dedicated fields and
+ *      KeyError applies repr().  Those instances are now matched on the text
+ *      they actually display, which is the reason the table understands
+ *      patterns at all.
  *
  * Everything is plain C on public API: nothing here imports Python code, so a
  * traceback stays printable no matter how broken the interpreter's import
- * machinery happens to be at that moment.
+ * machinery happens to be at that moment.  The pattern engine in the middle of
+ * this file does not use the Python API at all, so it can be compiled and
+ * exercised on its own (see MESSAGE_TABLE_PATTERN_TEST below).
  *
  * Table format (UTF-8, one entry per line, blank lines and '#' comments
- * ignored):
+ * ignored).  The two halves of an entry are separated by a TAB:
  *
- *     # original message,hex-encoded UTF-8 replacement
- *     division by zero,e7aca8e89b8be6898de4bc9ae68a8a30e694bee588b0e999a4e695b0e590a721
+ *     # original message<TAB>hex-encoded UTF-8 replacement
+ *     division by zero<TAB>e7aca8e89b8be6898de4bc9ae68a8a30e694bee588b0e999a4e695b0e590a721
  *
- * The right-hand side is what Python's bytes.hex() produces:
+ * The key is the message as it is, so it may hold commas, spaces, quotes and
+ * parentheses without escaping.  The TAB is the only separator and cannot be
+ * part of a key, and neither can a newline, which ends the line.  The
+ * right-hand side is what Python's bytes.hex() produces:
  *
  *     print(input().encode('utf-8').hex())
+ *
+ * A key without '*' is a literal message: the display text has to be equal to
+ * it and the replacement is used as it is.  A key with at least one '*' is a
+ * pattern: '*' stands for any run of characters, possibly empty, the runs are
+ * numbered in order of appearance, and the replacement can refer to the n-th
+ * of them as "%n".  Patterns are matched against the text the exception
+ * displays, so a single entry such as
+ *
+ *     unsupported operand type(s) for *: '*' and '*'<TAB>...
+ *
+ * covers every pair of operand types, where a literal key can only cover the
+ * pairs somebody enumerated in advance.
+ *
+ * Matching is leftmost and non-greedy: every '*' takes the shortest run that
+ * still lets the rest of the pattern match, earlier wildcards being decided
+ * first.  '*' is the only special character, so nothing has to be escaped.  A
+ * replacement that refers to a capture the pattern does not have ("%2" for a
+ * pattern with one '*', or "%0") is refused and the original message is kept,
+ * and so is a pattern with more than 64 wildcards.
  */
 
-#if defined(MESSAGE_TABLE_STUB_BUILD)
+#if defined(MESSAGE_TABLE_PATTERN_TEST)
+/*
+ * Standalone build of the pattern engine, without the interpreter, so that the
+ * matcher can be compiled and run with a plain C compiler:
+ *
+ *     gcc -DMESSAGE_TABLE_PATTERN_TEST -o pattern_test message_table.c
+ *     ./pattern_test          # built-in cases
+ *     ./pattern_test -        # cases read from stdin, hex-encoded
+ *     ./pattern_test --split  # table lines from stdin, split as the loader does
+ *
+ * Only the pattern engine, the table-line parser and the harness at the end of
+ * this file are compiled in; every part that needs Python.h is skipped.
+ */
+#define MESSAGE_TABLE_NO_PYTHON 1
+#endif
+
+#if defined(MESSAGE_TABLE_NO_PYTHON)
+#include <stdio.h>
+#include <stdlib.h>
+#elif defined(MESSAGE_TABLE_STUB_BUILD)
 /* Syntax/functional test build: the stub stands in for the CPython headers. */
 #include "py_stub_api.h"
 #else
@@ -37,17 +81,933 @@
 #include <string.h>
 
 /* ------------------------------------------------------------------ */
+/* pattern engine (no Python API)                                      */
+/* ------------------------------------------------------------------ */
+
+/*
+ * A key containing at least one '*' is a pattern.  Everything else in it is
+ * literal text that has to match byte for byte; '*' is the only character the
+ * matcher treats specially, so in particular the '%' that introduces a capture
+ * reference in the replacement needs no escaping in the key.
+ */
+#define MESSAGE_PATTERN_WILDCARD '*'
+#define MESSAGE_PATTERN_REFERENCE '%'
+
+/* Longest table line, replacement included. */
+#define MESSAGE_TABLE_MAX_LINE 4096
+
+/*
+ * Upper bound on the wildcards of one pattern.  A pattern is hand-written text
+ * for a message table, so one with more wildcards than this cannot come from a
+ * person writing one, and the bound keeps both the recursive matcher's stack
+ * use and the caller's capture buffer finite.  Longer patterns are dropped
+ * while the table is read, like any other malformed line.
+ */
+#define MESSAGE_PATTERN_MAX_STARS 64
+
+/*
+ * How many positions the matcher may try for one text.  A non-greedy search
+ * backtracks, so a pattern such as "*a*a*a*a*b" against a long run of 'a' can
+ * cost far more than a table author would expect.  Running out of budget is
+ * reported as "no match", which has the same visible result as a pattern that
+ * does not match: the original message is printed.
+ */
+#define MESSAGE_PATTERN_BUDGET 1000000
+
+typedef struct {
+    const char *text;
+    size_t text_size;
+    const char *pattern;
+    size_t pattern_size;
+    size_t star_count;
+    size_t *captures;           /* (offset, size) per wildcard, or NULL */
+    size_t budget;
+} PatternSearch;
+
+/*
+ * Number of wildcards in a pattern.  Zero means the key is a literal message,
+ * which is the one and only rule for telling the two kinds of entry apart.
+ */
+static size_t
+pattern_star_count(const char *pattern, size_t pattern_size)
+{
+    size_t count = 0;
+    for (size_t i = 0; i < pattern_size; i++) {
+        if (pattern[i] == MESSAGE_PATTERN_WILDCARD) {
+            count++;
+        }
+    }
+    return count;
+}
+
+/*
+ * The `index`-th literal segment of a pattern: the bytes between the
+ * (`index`-1)-th and the `index`-th wildcard.  A pattern with n wildcards has
+ * n + 1 segments, and the first and the last of them may be empty.
+ */
+static void
+pattern_segment(const char *pattern, size_t pattern_size, size_t index,
+                size_t *start, size_t *size)
+{
+    size_t position = 0;
+    size_t current = 0;
+    size_t begin = 0;
+
+    while (position <= pattern_size) {
+        if (position == pattern_size
+            || pattern[position] == MESSAGE_PATTERN_WILDCARD) {
+            if (current == index) {
+                *start = begin;
+                *size = position - begin;
+                return;
+            }
+            current++;
+            begin = position + 1;
+        }
+        position++;
+    }
+    /* Unreachable: callers pass an index below the segment count. */
+    *start = pattern_size;
+    *size = 0;
+}
+
+/*
+ * Length in bytes of the UTF-8 sequence that starts at text[position].  At
+ * least 1, so a caller that walks a text with this can never stand still; a
+ * byte that is not a valid lead byte, or a sequence cut short by the end of
+ * the text, counts as a single character.  Both sides of a match are expected
+ * to be valid UTF-8 (the table is decoded as such when it is read, and the
+ * display text of an exception always is), and this fallback only keeps the
+ * matcher total when one of them is not.
+ */
+static size_t
+pattern_char_size(const char *text, size_t text_size, size_t position)
+{
+    unsigned char lead = (unsigned char)text[position];
+    size_t size;
+
+    if (lead < 0x80) {
+        return 1;
+    }
+    if ((lead & 0xE0) == 0xC0) {
+        size = 2;
+    }
+    else if ((lead & 0xF0) == 0xE0) {
+        size = 3;
+    }
+    else if ((lead & 0xF8) == 0xF0) {
+        size = 4;
+    }
+    else {
+        return 1;               /* a continuation byte or an invalid lead */
+    }
+    if (position + size > text_size) {
+        return 1;           /* the sequence runs past the end of the text */
+    }
+    for (size_t i = 1; i < size; i++) {
+        if (((unsigned char)text[position + i] & 0xC0) != 0x80) {
+            return 1;           /* not a continuation byte: one byte it is */
+        }
+    }
+    return size;
+}
+
+/*
+ * Match the segments from `index` on against the text from `position` on, and
+ * record the run each wildcard takes on the way out.
+ *
+ * Wildcards are decided left to right and each one takes the shortest run that
+ * lets the remaining segments match, which is the non-greedy rule of the table
+ * format: the positions after a segment are tried in increasing order, so the
+ * first success is the shortest run.
+ */
+static int
+pattern_search(PatternSearch *search, size_t index, size_t position)
+{
+    size_t start, size;
+    pattern_segment(search->pattern, search->pattern_size, index,
+                    &start, &size);
+
+    if (size > search->text_size - position) {
+        return 0;
+    }
+    if (size > 0
+        && memcmp(search->text + position, search->pattern + start,
+                  size) != 0) {
+        return 0;
+    }
+    size_t after = position + size;
+
+    if (index == search->star_count) {
+        /* The last segment has to end the text: a pattern describes the whole
+           message, not a part of it. */
+        return after == search->text_size;
+    }
+    if (search->budget == 0) {
+        return 0;
+    }
+    search->budget--;
+
+    for (size_t end = after; ;
+         end += pattern_char_size(search->text, search->text_size, end)) {
+        if (pattern_search(search, index + 1, end)) {
+            if (search->captures != NULL) {
+                /* Segment `index` ends where the wildcard after it starts. */
+                search->captures[2 * index] = after;
+                search->captures[2 * index + 1] = end - after;
+            }
+            return 1;
+        }
+        if (end >= search->text_size) {
+            return 0;
+        }
+    }
+}
+
+/*
+ * Match a whole pattern against a whole text.  On a match, fills `captures`
+ * with `star_count` (offset, size) pairs, one per wildcard in order of
+ * appearance, and returns 1; otherwise returns 0 and leaves `captures` alone.
+ * Pass NULL for `captures` to ask whether the pattern matches at all.
+ */
+static int
+pattern_match(const char *pattern, size_t pattern_size,
+              const char *text, size_t text_size,
+              size_t star_count, size_t *captures)
+{
+    PatternSearch search;
+    search.text = text;
+    search.text_size = text_size;
+    search.pattern = pattern;
+    search.pattern_size = pattern_size;
+    search.star_count = star_count;
+    search.captures = captures;
+    search.budget = MESSAGE_PATTERN_BUDGET;
+    return pattern_search(&search, 0, 0);
+}
+
+/*
+ * Read the capture reference at replacement[*position], which is a '%'
+ * followed by one or more decimal digits.
+ *
+ * Returns 0 when there is no reference here, so the '%' is literal text; -1
+ * when the reference is out of range for a pattern with `star_count`
+ * wildcards, which makes the whole replacement unusable; and the capture
+ * number otherwise, leaving *position after the digits.
+ */
+static long
+pattern_reference(const char *replacement, size_t replacement_size,
+                  size_t *position, size_t star_count)
+{
+    size_t i = *position + 1;   /* step over the '%' */
+    if (i >= replacement_size
+        || replacement[i] < '0' || replacement[i] > '9') {
+        return 0;
+    }
+
+    size_t value = 0;
+    while (i < replacement_size
+           && replacement[i] >= '0' && replacement[i] <= '9') {
+        value = value * 10 + (size_t)(replacement[i] - '0');
+        if (value > star_count) {
+            /* More digits can only make it larger. */
+            return -1;
+        }
+        i++;
+    }
+    *position = i;
+    if (value == 0) {
+        return -1;              /* captures are numbered from 1 */
+    }
+    return (long)value;
+}
+
+/*
+ * Build the replacement text: every "%n" in `replacement` becomes the run the
+ * n-th wildcard captured in `text`.
+ *
+ * Returns 1 with a malloc'ed NUL-terminated buffer in *result and its length
+ * in *result_size, or 0 with *result NULL when the replacement names a capture
+ * the pattern does not have.  Callers then keep the original message: a
+ * reference that cannot be resolved must not silently delete text from it.
+ */
+static int
+pattern_expand(const char *replacement, size_t replacement_size,
+               const char *text, const size_t *captures, size_t star_count,
+               char **result, size_t *result_size)
+{
+    *result = NULL;
+    *result_size = 0;
+
+    /* First pass: check every reference and measure the result. */
+    size_t size = 0;
+    size_t position = 0;
+    while (position < replacement_size) {
+        if (replacement[position] != MESSAGE_PATTERN_REFERENCE) {
+            position++;
+            size++;
+            continue;
+        }
+        size_t after = position;
+        long reference = pattern_reference(replacement, replacement_size,
+                                           &after, star_count);
+        if (reference < 0) {
+            return 0;
+        }
+        if (reference == 0) {
+            position++;         /* a literal '%' */
+            size++;
+            continue;
+        }
+        size += captures[2 * (size_t)(reference - 1) + 1];
+        position = after;
+    }
+
+    char *buffer = malloc(size + 1);
+    if (buffer == NULL) {
+        return 0;
+    }
+
+    /* Second pass: the same walk, copying. */
+    size_t written = 0;
+    position = 0;
+    while (position < replacement_size) {
+        if (replacement[position] != MESSAGE_PATTERN_REFERENCE) {
+            buffer[written++] = replacement[position++];
+            continue;
+        }
+        size_t after = position;
+        long reference = pattern_reference(replacement, replacement_size,
+                                           &after, star_count);
+        if (reference <= 0) {
+            buffer[written++] = replacement[position++];
+            continue;
+        }
+        size_t offset = captures[2 * (size_t)(reference - 1)];
+        size_t length = captures[2 * (size_t)(reference - 1) + 1];
+        memcpy(buffer + written, text + offset, length);
+        written += length;
+        position = after;
+    }
+    buffer[written] = '\0';
+
+    *result = buffer;
+    *result_size = written;
+    return 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* table lines (no Python API)                                         */
+/* ------------------------------------------------------------------ */
+
+/*
+ * One entry per line is "<key>\t<hex-encoded value>": a TAB separates the two
+ * halves, and nothing else does.  A message can therefore hold commas, spaces,
+ * quotes and parentheses without any escaping, and the only characters a key
+ * cannot contain are the TAB (it is the separator) and the newline (it ends
+ * the line).
+ */
+#define MESSAGE_TABLE_SEPARATOR '\t'
+#define MESSAGE_TABLE_COMMENT '#'
+
+/* Drop the leading and trailing blanks of a line, in place. */
+static char *
+trim_line(char *line)
+{
+    while (*line == ' ' || *line == '\t' || *line == '\r' || *line == '\n') {
+        line++;
+    }
+    size_t len = strlen(line);
+    while (len > 0) {
+        char last = line[len - 1];
+        if (last != ' ' && last != '\t' && last != '\r' && last != '\n') {
+            break;
+        }
+        line[--len] = '\0';
+    }
+    return line;
+}
+
+/*
+ * Split one line of the table into its key and its hex-encoded value, in
+ * place: the line is cut at the first TAB, and both halves are trimmed, so
+ * extra blanks around the separator and a trailing TAB are harmless.
+ *
+ * Presence of the TAB decides what the line is, so a message that begins with
+ * '#' is safe: "# channels not specified" is one CPython prints, and the old
+ * "starts with '#' => comment" rule dropped it silently.  A line without a TAB
+ * is a comment when it starts with '#', and malformed otherwise.
+ *
+ * Returns 1 when the line holds an entry and fills *key and *hex with pointers
+ * into it, 0 for a line to ignore (blank or a '#' comment), and -1 for a
+ * malformed line: one without a TAB that is not a comment, or with an empty key
+ * or an empty value.  Callers skip anything but 1, which keeps a broken table
+ * from stopping the interpreter from printing the original message.
+ */
+static int
+table_split_line(char *line, char **key, char **hex)
+{
+    char *text = trim_line(line);
+    if (text[0] == '\0') {
+        return 0;
+    }
+    char *separator = strchr(text, MESSAGE_TABLE_SEPARATOR);
+    if (separator == NULL) {
+        /* No TAB: a comment if it starts with '#', otherwise malformed. */
+        return (text[0] == MESSAGE_TABLE_COMMENT) ? 0 : -1;
+    }
+    *separator = '\0';
+    *key = trim_line(text);
+    *hex = trim_line(separator + 1);
+    if (*key[0] == '\0' || *hex[0] == '\0') {
+        return -1;
+    }
+    return 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* standalone test harness                                             */
+/* ------------------------------------------------------------------ */
+
+#ifdef MESSAGE_TABLE_NO_PYTHON
+
+typedef struct {
+    const char *key;
+    size_t stars;                       /* expected wildcard count */
+} StarCountCase;
+
+/* A key is a pattern exactly when it holds at least one '*'. */
+static const StarCountCase star_count_cases[] = {
+    {"division by zero", 0},
+    {"100% done", 0},                   /* '%' is not a wildcard */
+    {"[Errno 2] No such file or directory: '/nope'", 0},
+    {"", 0},
+    {"'*' object has no attribute '*'", 2},
+    {"*", 1},
+    {"*: '*' and '*'", 3},
+    {"100% *", 1},
+};
+
+typedef struct {
+    const char *pattern;
+    const char *text;
+    int matches;                        /* expected match result */
+    const char *captures[4];            /* expected runs; "" is an empty run */
+    const char *replacement;            /* NULL: do not expand */
+    const char *expanded;               /* expected expansion; NULL: refused */
+} PatternCase;
+
+/*
+ * Text and patterns hold non-ASCII as \x escapes on purpose: the wildcard must
+ * never split a UTF-8 sequence, and escaping keeps the cases readable and this
+ * file ASCII-only.  "" means an empty run, so a case that expects no captures
+ * at all leaves every entry NULL.
+ */
+static const PatternCase pattern_cases[] = {
+    /* A pattern without a wildcard is an ordinary whole-string match. */
+    {"abc", "abc", 1, {NULL}, NULL, NULL},
+    {"abc", "abc", 1, {NULL}, "xyz", "xyz"},     /* no reference: as it is */
+    {"abc", "abc", 1, {NULL}, "%1", NULL},          /* no capture to name */
+    {"abc", "xabc", 0, {NULL}, NULL, NULL},
+    {"abc", "abcd", 0, {NULL}, NULL, NULL},
+    {"", "", 1, {NULL}, NULL, NULL},
+    {"", "x", 0, {NULL}, NULL, NULL},
+
+    /* A lone wildcard takes everything, including nothing. */
+    {"*", "", 1, {""}, "", ""},
+    {"*", "abc", 1, {"abc"}, "100% of %1", "100% of abc"},
+    {"*", "abc", 1, {"abc"}, "%1 and %2", NULL},    /* no second capture */
+    {"*", "abc", 1, {"abc"}, "%0", NULL},           /* captures start at 1 */
+    {"*", "abc", 1, {"abc"}, "%", "%"},       /* a trailing '%' is a literal */
+    {"*", "50% off", 1, {"50% off"}, "[%1]", "[50% off]"},
+
+    /* Non-greedy: the first wildcard takes the shortest run that works. */
+    {"*a*", "xaxa", 1, {"x", "xa"}, NULL, NULL},
+    {"*b*", "abcb", 1, {"a", "cb"}, NULL, NULL},
+    {"*a*", "a", 1, {"", ""}, NULL, NULL},
+    {"*a*a*", "aaa", 1, {"", "", "a"}, NULL, NULL},
+
+    /* The wildcards are anchored: the ends of the pattern are the ends of the
+       text.  An empty run is possible wherever a wildcard meets a literal. */
+    {"*c", "abc", 1, {"ab"}, NULL, NULL},
+    {"*c", "abcd", 0, {NULL}, NULL, NULL},
+    {"a*", "abc", 1, {"bc"}, NULL, NULL},
+    {"b*", "ab", 0, {NULL}, NULL, NULL},
+    {"*x", "x", 1, {""}, NULL, NULL},
+
+    /* Several wildcards, and a literal '*' inside the text being matched. */
+    {"*: '*' and '*'",
+     "unsupported operand type(s) for *: 'int' and 'float'", 1,
+     {"unsupported operand type(s) for *", "int", "float"},
+     "%3 and %2 do not support %1",
+     "float and int do not support unsupported operand type(s) for *"},
+    {"*: '*' and '*'", "'int' and 'float'", 0, {NULL}, NULL, NULL},
+    {"100% *", "100% done", 1, {"done"}, "100% %1", "100% done"},
+
+    /* Multi-byte characters: U+03B1 (two bytes), U+20AC (three bytes) and
+       U+1F40D (four bytes) must survive a wildcard on either side. */
+    {"*\xce\xb1*", "\xce\xb1\xce\xb1", 1, {"", "\xce\xb1"},
+     "<%1%2>", "<\xce\xb1>"},
+    {"*\xce\xb1*", "A\xce\xb1" "B", 1, {"A", "B"}, "%2-%1", "B-A"},
+    {"*\xe2\x82\xac*", "cost \xe2\x82\xac" " 5", 1, {"cost ", " 5"},
+     NULL, NULL},
+    {"*\xf0\x9f\x90\x8d*", "a\xf0\x9f\x90\x8d", 1, {"a", ""}, NULL, NULL},
+    /* A byte that is not valid UTF-8 counts as one character, never as half of
+       one: the matcher has to stay total even on input it does not expect. */
+    {"*a*", "\xff" "a" "\xff", 1, {"\xff", "\xff"}, NULL, NULL},
+
+    /* A key may hold a comma: the separator is a TAB, nothing else. */
+    {"byte must be in range(0, 256)", "byte must be in range(0, 256)", 1,
+     {NULL}, NULL, NULL},
+    {"minute, second, and microsecond must be 0 when hour is 24",
+     "minute, second, and microsecond must be 0 when hour is 24", 1,
+     {NULL}, NULL, NULL},
+    {"character mapping must return integer, None or str",
+     "character mapping must return integer, None or str", 1,
+     {NULL}, NULL, NULL},
+    {"Hour must be in [0, *]", "Hour must be in [0, 167]", 1, {"167"},
+     "Hour must be in [0, %1]", "Hour must be in [0, 167]"},
+};
+
+typedef struct {
+    const char *line;               /* the line as it appears in the file */
+    int verdict;                    /* expected table_split_line() result */
+    const char *key;                /* expected key, when verdict is 1 */
+    const char *hex;                /* expected value, when verdict is 1 */
+} SplitCase;
+
+/*
+ * The separator is a TAB, so a key may hold a comma: the first cases are
+ * messages the old comma-separated format could not carry at all, and the rest
+ * are the shapes a line can take around the separator, including the ones that
+ * have to be ignored (0) or rejected (-1).
+ */
+static const SplitCase split_cases[] = {
+    {"byte must be in range(0, 256)\t62797465", 1,
+     "byte must be in range(0, 256)", "62797465"},
+    {"minute, second, and microsecond must be 0 when hour is 24\t6162", 1,
+     "minute, second, and microsecond must be 0 when hour is 24", "6162"},
+    {"Hour must be in [0, *]\t*", 1, "Hour must be in [0, *]", "*"},
+
+    /* Blanks around the separator, a second TAB, a CRLF and a '#' that is not
+       at the start of the line. */
+    {" division by zero \t e7aca8 ", 1, "division by zero", "e7aca8"},
+    {"division by zero\t\te7aca8", 1, "division by zero", "e7aca8"},
+    {"division by zero\te7aca8\t", 1, "division by zero", "e7aca8"},
+    {"division by zero\te7aca8\r\n", 1, "division by zero", "e7aca8"},
+    {"a # b\t00", 1, "a # b", "00"},
+    /* A message may start with '#'.  CPython prints "# channels not specified",
+       and the old "starts with '#' => comment" rule dropped it silently, so the
+       TAB decides: with one the line is an entry, without one it is a comment. */
+    {"# channels not specified\t6162", 1, "# channels not specified", "6162"},
+    {"#not a comment because of the TAB\t00", 1, "#not a comment because of the TAB", "00"},
+
+    /* Lines to ignore. */
+    {"", 0, NULL, NULL},
+    {"   ", 0, NULL, NULL},
+    {"\t", 0, NULL, NULL},
+    {"# comment", 0, NULL, NULL},
+    /* '#' with a TAB is an entry now, not a comment: key "# comment", value
+       "with a TAB" (which is not hex, so the loader drops it as a bad value --
+       the splitter's job is only to hand the halves over). */
+    {"   # comment\twith a TAB", 1, "# comment", "with a TAB"},
+
+    /* Malformed lines: no TAB (which includes the old comma format), an empty
+       key and an empty value.  Leading blanks are trimmed before the separator
+       is looked for, so a line that starts with the separator reaches this
+       branch as "no separator" instead. */
+    {"byte must be in range(0, 256)", -1, NULL, NULL},
+    {"division by zero,e7aca8", -1, NULL, NULL},
+    {"\te7aca8", -1, NULL, NULL},
+    {"division by zero\t", -1, NULL, NULL},
+    {"division by zero\t   ", -1, NULL, NULL},
+    {"division by zero\t\t\t", -1, NULL, NULL},
+};
+
+static int pattern_test_checks = 0;
+static int pattern_test_failures = 0;
+
+/* Print bytes so that the output is ASCII and stays comparable anywhere. */
+static void
+print_bytes(const char *bytes, size_t size)
+{
+    for (size_t i = 0; i < size; i++) {
+        unsigned char byte = (unsigned char)bytes[i];
+        if (byte >= 0x20 && byte < 0x7f) {
+            putchar((int)byte);
+        }
+        else {
+            printf("\\x%02x", (unsigned int)byte);
+        }
+    }
+}
+
+static void
+print_quoted(const char *bytes)
+{
+    putchar('"');
+    print_bytes(bytes, strlen(bytes));
+    putchar('"');
+}
+
+/*
+ * One line of the table: the verdict, and for an entry the two halves it split
+ * into.  The separator shows up as \x09 in the printed line.
+ */
+static void
+check_split(const SplitCase *test)
+{
+    char buffer[MESSAGE_TABLE_MAX_LINE];
+    snprintf(buffer, sizeof(buffer), "%s", test->line);
+    char *key = NULL;
+    char *hex = NULL;
+    int verdict = table_split_line(buffer, &key, &hex);
+
+    pattern_test_checks++;
+    printf("      line=");
+    print_quoted(test->line);
+    printf(" verdict=%d", verdict);
+
+    int failed = (verdict != test->verdict);
+    if (verdict == 1) {
+        printf(" key=");
+        print_quoted(key);
+        printf(" hex=");
+        print_quoted(hex);
+        if (test->key == NULL || strcmp(key, test->key) != 0) {
+            printf("(expected key ");
+            print_quoted(test->key != NULL ? test->key : "");
+            putchar(')');
+            failed = 1;
+        }
+        if (test->hex == NULL || strcmp(hex, test->hex) != 0) {
+            printf("(expected hex ");
+            print_quoted(test->hex != NULL ? test->hex : "");
+            putchar(')');
+            failed = 1;
+        }
+    }
+    putchar('\n');
+    if (failed) {
+        pattern_test_failures++;
+        printf("FAIL  split case with expected verdict %d\n", test->verdict);
+    }
+}
+
+static void
+check_star_count(const StarCountCase *test)
+{
+    size_t stars = pattern_star_count(test->key, strlen(test->key));
+    pattern_test_checks++;
+    if (stars != test->stars) {
+        pattern_test_failures++;
+        printf("FAIL  star count of ");
+        print_quoted(test->key);
+        printf(" is %lu, expected %lu\n",
+               (unsigned long)stars, (unsigned long)test->stars);
+    }
+    else {
+        printf("ok    star count of ");
+        print_quoted(test->key);
+        printf(" is %lu\n", (unsigned long)stars);
+    }
+}
+
+static void
+check_case(const PatternCase *test)
+{
+    size_t pattern_size = strlen(test->pattern);
+    size_t text_size = strlen(test->text);
+    size_t stars = pattern_star_count(test->pattern, pattern_size);
+    size_t captures[2 * MESSAGE_PATTERN_MAX_STARS];
+    int matched = pattern_match(test->pattern, pattern_size,
+                                test->text, text_size, stars, captures);
+
+    pattern_test_checks++;
+    printf("      pattern=");
+    print_quoted(test->pattern);
+    printf(" text=");
+    print_quoted(test->text);
+    printf(" stars=%lu match=%d", (unsigned long)stars, matched);
+
+    int failed = (matched != test->matches);
+    if (matched) {
+        for (size_t i = 0; i < stars; i++) {
+            const char *expected = test->captures[i];
+            size_t offset = captures[2 * i];
+            size_t size = captures[2 * i + 1];
+            printf(" cap%lu=", (unsigned long)(i + 1));
+            print_bytes(test->text + offset, size);
+            if (expected == NULL
+                || strlen(expected) != size
+                || memcmp(expected, test->text + offset, size) != 0) {
+                printf("(expected ");
+                print_quoted(expected != NULL ? expected : "");
+                putchar(')');
+                failed = 1;
+            }
+        }
+    }
+
+    if (test->replacement != NULL) {
+        char *expanded = NULL;
+        size_t expanded_size = 0;
+        int ok = pattern_expand(test->replacement, strlen(test->replacement),
+                                test->text, captures, stars,
+                                &expanded, &expanded_size);
+        printf(" expanded=");
+        if (!ok) {
+            printf("REFUSED");
+        }
+        else {
+            print_quoted(expanded);
+        }
+        if (test->expanded == NULL) {
+            if (ok) {
+                printf("(expected REFUSED)");
+                failed = 1;
+            }
+        }
+        else if (!ok
+                 || strlen(test->expanded) != expanded_size
+                 || memcmp(test->expanded, expanded, expanded_size) != 0) {
+            printf("(expected ");
+            print_quoted(test->expanded);
+            putchar(')');
+            failed = 1;
+        }
+        free(expanded);
+    }
+
+    putchar('\n');
+    if (failed) {
+        pattern_test_failures++;
+        printf("FAIL  case %lu\n", (unsigned long)pattern_test_checks);
+    }
+}
+
+/* Decode a hex field of the stdin protocol; NULL on anything malformed. */
+static char *
+test_from_hex(const char *hex, size_t *size)
+{
+    size_t length = strlen(hex);
+    if (length % 2 != 0) {
+        return NULL;
+    }
+    char *bytes = malloc(length / 2 + 1);
+    if (bytes == NULL) {
+        return NULL;
+    }
+    for (size_t i = 0; i < length / 2; i++) {
+        int value = 0;
+        for (int half = 0; half < 2; half++) {
+            int digit = hex[2 * i + half];
+            value <<= 4;
+            if (digit >= '0' && digit <= '9') {
+                value |= digit - '0';
+            }
+            else if (digit >= 'a' && digit <= 'f') {
+                value |= digit - 'a' + 10;
+            }
+            else if (digit >= 'A' && digit <= 'F') {
+                value |= digit - 'A' + 10;
+            }
+            else {
+                free(bytes);
+                return NULL;
+            }
+        }
+        bytes[i] = (char)value;
+    }
+    bytes[length / 2] = '\0';
+    *size = length / 2;
+    return bytes;
+}
+
+static void
+print_hex(const char *bytes, size_t size)
+{
+    for (size_t i = 0; i < size; i++) {
+        printf("%02x", (unsigned int)(unsigned char)bytes[i]);
+    }
+}
+
+/*
+ * Cases from stdin, one per line, hex-encoded and tab separated:
+ *
+ *     <pattern-hex> \t <text-hex> \t <replacement-hex>
+ *
+ * The third field is optional; without it the line only asks for match and
+ * captures.  The answer is one line per case:
+ *
+ *     <match 0|1> \t <stars> \t <capture-hex>... \t <-|REFUSED|OK:hex>
+ */
+static int
+run_stdin_cases(void)
+{
+    char line[3 * (int)MESSAGE_TABLE_MAX_LINE + 8];
+    int failures = 0;
+    int cases = 0;
+
+    while (fgets(line, (int)sizeof(line), stdin) != NULL) {
+        size_t length = strlen(line);
+        while (length > 0
+               && (line[length - 1] == '\n' || line[length - 1] == '\r')) {
+            line[--length] = '\0';
+        }
+        if (length == 0) {
+            continue;
+        }
+        char *fields[3] = {line, NULL, NULL};
+        int field_count = 1;
+        for (char *at = line; *at != '\0' && field_count < 3; at++) {
+            if (*at == '\t') {
+                *at = '\0';
+                fields[field_count++] = at + 1;
+            }
+        }
+
+        size_t pattern_size = 0, text_size = 0, replacement_size = 0;
+        char *pattern = test_from_hex(fields[0], &pattern_size);
+        char *text = test_from_hex(fields[1], &text_size);
+        char *replacement = (field_count == 3)
+            ? test_from_hex(fields[2], &replacement_size) : NULL;
+        if (pattern == NULL || text == NULL
+            || (field_count == 3 && replacement == NULL)) {
+            printf("ERROR malformed case\n");
+            failures++;
+            free(pattern);
+            free(text);
+            free(replacement);
+            continue;
+        }
+
+        cases++;
+        size_t stars = pattern_star_count(pattern, pattern_size);
+        size_t captures[2 * MESSAGE_PATTERN_MAX_STARS];
+        int matched = pattern_match(pattern, pattern_size, text, text_size,
+                                    stars, captures);
+        printf("%d\t%lu", matched, (unsigned long)stars);
+        if (matched) {
+            for (size_t i = 0; i < stars; i++) {
+                putchar('\t');
+                print_hex(text + captures[2 * i], captures[2 * i + 1]);
+            }
+        }
+        if (field_count < 3) {
+            printf("\t-\n");
+        }
+        else {
+            char *expanded = NULL;
+            size_t expanded_size = 0;
+            int expanded_ok = matched
+                && pattern_expand(replacement, replacement_size, text,
+                                  captures, stars, &expanded, &expanded_size);
+            if (expanded_ok) {
+                printf("\tOK:");
+                print_hex(expanded, expanded_size);
+                putchar('\n');
+            }
+            else {
+                printf("\tREFUSED\n");
+            }
+            free(expanded);
+        }
+
+        free(pattern);
+        free(text);
+        free(replacement);
+    }
+
+    fprintf(stderr, "%d stdin cases, %d malformed\n", cases, failures);
+    return failures == 0 ? 0 : 1;
+}
+
+/*
+ * Lines from stdin, one per line, answered with table_split_line()'s verdict
+ * and, for an entry, the key and the value as hex:
+ *
+ *     <verdict 1|0|-1> \t <key-hex> \t <value-hex>
+ */
+static int
+run_split_cases(void)
+{
+    char line[MESSAGE_TABLE_MAX_LINE];
+
+    while (fgets(line, (int)sizeof(line), stdin) != NULL) {
+        /* fgets() keeps the newline; the splitter trims it off. */
+        char *key = NULL;
+        char *hex = NULL;
+        int verdict = table_split_line(line, &key, &hex);
+        printf("%d", verdict);
+        putchar('\t');
+        if (verdict == 1) {
+            print_hex(key, strlen(key));
+            putchar('\t');
+            print_hex(hex, strlen(hex));
+        }
+        putchar('\n');
+    }
+    return 0;
+}
+
+int
+main(int argc, char **argv)
+{
+    if (argc > 1 && strcmp(argv[1], "-") == 0) {
+        return run_stdin_cases();
+    }
+    if (argc > 1 && strcmp(argv[1], "--split") == 0) {
+        return run_split_cases();
+    }
+
+    printf("star counts\n");
+    for (size_t i = 0;
+         i < sizeof(star_count_cases) / sizeof(star_count_cases[0]); i++) {
+        check_star_count(&star_count_cases[i]);
+    }
+
+    printf("table lines\n");
+    for (size_t i = 0; i < sizeof(split_cases) / sizeof(split_cases[0]); i++) {
+        check_split(&split_cases[i]);
+    }
+
+    printf("matching and expansion\n");
+    for (size_t i = 0;
+         i < sizeof(pattern_cases) / sizeof(pattern_cases[0]); i++) {
+        check_case(&pattern_cases[i]);
+    }
+
+    printf("\n%lu checks, %lu failures\n",
+           (unsigned long)pattern_test_checks,
+           (unsigned long)pattern_test_failures);
+    return pattern_test_failures == 0 ? 0 : 1;
+}
+
+#endif /* MESSAGE_TABLE_NO_PYTHON */
+
+#ifndef MESSAGE_TABLE_NO_PYTHON
+
+/* ------------------------------------------------------------------ */
 /* table                                                               */
 /* ------------------------------------------------------------------ */
 
 typedef struct {
-    PyObject *key;              /* original message, a str object */
-    PyObject *value;            /* replacement text, a str object */
+    PyObject *key;              /* original message or pattern, a str */
+    PyObject *value;            /* replacement text, a str */
+    const char *key_utf8;       /* key as UTF-8, owned by `key`; NULL for a
+                                   literal key */
+    Py_ssize_t key_utf8_size;
+    const char *value_utf8;     /* replacement as UTF-8, owned by `value`;
+                                   NULL for a literal key */
+    Py_ssize_t value_utf8_size;
+    size_t star_count;          /* 0 when `key` is a literal message */
 } MessageEntry;
 
 typedef struct {
     MessageEntry *entries;
     Py_ssize_t count;
+    Py_ssize_t pattern_count;   /* entries with at least one wildcard */
 } MessageTable;
 
 #define MESSAGE_TABLE_ENV "PYTHON_MESSAGE_TABLE"
@@ -200,24 +1160,87 @@ message_table_open(PyObject *path)
 #endif
 }
 
-static char *
-trim_line(char *line)
+/*
+ * Prepare one entry of the table, appending it to `table`.
+ *
+ * A key with no '*' is a literal message and is stored as it is.  A key with
+ * at least one '*' is a pattern, and both the pattern and the replacement are
+ * cached as UTF-8 bytes: the pattern engine works on bytes, and the cached
+ * pointer stays valid because the entry holds a reference to the str that owns
+ * it.  A pattern that cannot be encoded, or that has more wildcards than
+ * MESSAGE_PATTERN_MAX_STARS, is dropped like a malformed line.
+ */
+static void
+message_table_add(MessageTable *table, char *key, char *hex,
+                  Py_ssize_t *capacity)
 {
-    while (*line == ' ' || *line == '\t' || *line == '\r' || *line == '\n') {
-        line++;
+    PyObject *value = from_hex(hex);
+    if (value == NULL) {
+        /* A malformed value must never stop the interpreter from printing the
+           original message: drop the entry and carry on. */
+        PyErr_Clear();
+        return;
     }
-    size_t len = strlen(line);
-    while (len > 0) {
-        char last = line[len - 1];
-        if (last != ' ' && last != '\t' && last != '\r' && last != '\n') {
-            break;
-        }
-        line[--len] = '\0';
+    PyObject *key_obj = PyUnicode_FromString(key);
+    if (key_obj == NULL) {
+        Py_DECREF(value);
+        PyErr_Clear();
+        return;
     }
-    return line;
-}
 
-#define MESSAGE_TABLE_MAX_LINE 4096
+    MessageEntry entry;
+    entry.key = key_obj;
+    entry.value = value;
+    entry.key_utf8 = NULL;
+    entry.key_utf8_size = 0;
+    entry.value_utf8 = NULL;
+    entry.value_utf8_size = 0;
+    entry.star_count = 0;
+
+    if (strchr(key, MESSAGE_PATTERN_WILDCARD) != NULL) {
+        Py_ssize_t key_size = 0;
+        Py_ssize_t value_size = 0;
+        const char *key_utf8 = PyUnicode_AsUTF8AndSize(key_obj, &key_size);
+        const char *value_utf8 = (key_utf8 != NULL)
+            ? PyUnicode_AsUTF8AndSize(value, &value_size) : NULL;
+        if (key_utf8 == NULL || value_utf8 == NULL) {
+            PyErr_Clear();
+            Py_DECREF(key_obj);
+            Py_DECREF(value);
+            return;
+        }
+        size_t stars = pattern_star_count(key_utf8, (size_t)key_size);
+        if (stars > MESSAGE_PATTERN_MAX_STARS) {
+            Py_DECREF(key_obj);
+            Py_DECREF(value);
+            return;
+        }
+        entry.key_utf8 = key_utf8;
+        entry.key_utf8_size = key_size;
+        entry.value_utf8 = value_utf8;
+        entry.value_utf8_size = value_size;
+        entry.star_count = stars;
+    }
+
+    if (table->count == *capacity) {
+        Py_ssize_t bigger_capacity = *capacity * 2;
+        MessageEntry *bigger = PyMem_Realloc(
+            table->entries, (size_t)bigger_capacity * sizeof(MessageEntry));
+        if (bigger == NULL) {
+            /* Keep what we have, drop the rest. */
+            Py_DECREF(key_obj);
+            Py_DECREF(value);
+            return;
+        }
+        table->entries = bigger;
+        *capacity = bigger_capacity;
+    }
+    table->entries[table->count] = entry;
+    table->count++;
+    if (entry.star_count != 0) {
+        table->pattern_count++;
+    }
+}
 
 static MessageTable *
 message_table_load(void)
@@ -254,52 +1277,16 @@ message_table_load(void)
         return NULL;
     }
     table->count = 0;
+    table->pattern_count = 0;
 
     char line[MESSAGE_TABLE_MAX_LINE];
     while (fgets(line, (int)sizeof(line), fp) != NULL) {
-        char *text = trim_line(line);
-        if (text[0] == '\0' || text[0] == '#') {
-            continue;
+        char *key = NULL;
+        char *hex = NULL;
+        if (table_split_line(line, &key, &hex) != 1) {
+            continue;             /* blank, comment or malformed: skip it */
         }
-        char *comma = strchr(text, ',');
-        if (comma == NULL) {
-            continue;                 /* malformed line: skip it */
-        }
-        *comma = '\0';
-        char *key = trim_line(text);
-        char *hex = trim_line(comma + 1);
-        if (key[0] == '\0' || hex[0] == '\0') {
-            continue;
-        }
-
-        PyObject *value = from_hex(hex);
-        if (value == NULL) {
-            /* A malformed value must never stop the interpreter from printing
-               the original message: drop the entry and carry on. */
-            PyErr_Clear();
-            continue;
-        }
-        PyObject *key_obj = PyUnicode_FromString(key);
-        if (key_obj == NULL) {
-            Py_DECREF(value);
-            PyErr_Clear();
-            continue;
-        }
-
-        if (table->count == capacity) {
-            capacity *= 2;
-            MessageEntry *bigger = PyMem_Realloc(
-                table->entries, (size_t)capacity * sizeof(MessageEntry));
-            if (bigger == NULL) {
-                Py_DECREF(key_obj);
-                Py_DECREF(value);
-                break;                /* keep what we have, drop the rest */
-            }
-            table->entries = bigger;
-        }
-        table->entries[table->count].key = key_obj;
-        table->entries[table->count].value = value;
-        table->count++;
+        message_table_add(table, key, hex, &capacity);
     }
 
     fclose(fp);
@@ -336,54 +1323,50 @@ _PyMessageTable_Fini(void)
 /* ------------------------------------------------------------------ */
 
 /*
- * The message `exc` would display, or NULL when replacing it is impossible.
+ * The message `exc` would display, or NULL when there is nothing to match.
  *
- * BaseException.__str__ returns str(args[0]) when there is exactly one
- * argument, which covers almost every builtin exception message.  Types that
- * override __str__ are compared against the real display instead: if the text
- * does not start with args[0] (OSError gains an "[Errno 2] " prefix, KeyError
- * adds quotes, UnicodeDecodeError builds its own text), args is not what drives
- * the display and the exception is left alone.
+ * Two cases, in this order:
  *
- * Returns a new reference.
+ *   1. When tp_str is BaseException's, the displayed text is defined to be
+ *      str(args[0]), so a str args[0] is the text itself and no string has to
+ *      be built.  This is the fast path, and it is also the only case the
+ *      table could ever match before it learned about patterns.  (With more
+ *      than one argument the display is the repr of the whole tuple; the fast
+ *      path still takes args[0], which is what the table is written against.)
+ *
+ *   2. Otherwise the display text is whatever __str__ computes: OSError
+ *      prepends "[Errno 2] ", KeyError applies repr(), UnicodeDecodeError
+ *      builds its own line.  That text is used as it is -- there is no
+ *      assumption that it starts with args[0] (which used to put all of those
+ *      out of reach), and args does not have to hold a string at all.
+ *
+ * Returns a new reference, or NULL with no exception set.
  */
 static PyObject *
 replaceable_message(PyObject *exc)
 {
-    PyObject *args = PyException_GetArgs(exc);
-    if (args == NULL) {
-        PyErr_Clear();
-        return NULL;
-    }
-    if (!PyTuple_Check(args) || PyTuple_GET_SIZE(args) == 0) {
-        Py_DECREF(args);
-        return NULL;
-    }
-
-    PyObject *first = PyTuple_GET_ITEM(args, 0);   /* borrowed */
-    if (!PyUnicode_Check(first)) {
-        Py_DECREF(args);
-        return NULL;
-    }
-
     if (Py_TYPE(exc)->tp_str == Py_TYPE(PyExc_BaseException)->tp_str) {
-        /* The standard __str__: the display is args[0], no probe needed. */
-        PyObject *result = Py_NewRef(first);
-        Py_DECREF(args);
-        return result;
+        PyObject *args = PyException_GetArgs(exc);
+        if (args == NULL) {
+            PyErr_Clear();
+        }
+        else {
+            if (PyTuple_Check(args) && PyTuple_GET_SIZE(args) > 0) {
+                PyObject *first = PyTuple_GET_ITEM(args, 0);
+                if (PyUnicode_Check(first)) {
+                    Py_DECREF(args);
+                    return Py_NewRef(first);
+                }
+            }
+            Py_DECREF(args);
+        }
     }
 
-    Py_ssize_t len = PyUnicode_GET_LENGTH(first);
     PyObject *shown = PyObject_Str(exc);
-    Py_DECREF(args);
     if (shown == NULL) {
         PyErr_Clear();
-        return NULL;
     }
-    int matches = (len > 0 && PyUnicode_GET_LENGTH(shown) >= len
-                   && PyUnicode_Tailmatch(shown, first, 0, len, -1) > 0);
-    Py_DECREF(shown);
-    return matches ? Py_NewRef(first) : NULL;
+    return shown;
 }
 
 /*
@@ -477,11 +1460,112 @@ copy_exception(PyObject *exc)
 }
 
 /*
+ * The fields a SyntaxError renders its location from: the message plus the
+ * file, the line and the span the caret covers.
+ */
+static const char *const syntax_error_location[] = {
+    "filename", "lineno", "offset", "text", "end_lineno", "end_offset", NULL,
+};
+
+/*
+ * Put `replacement` into the message of a SyntaxError `copy` and carry the
+ * location over from `value`.
+ *
+ * Both live in C-level members, so a copy built with __new__ has them NULL and
+ * copying __dict__ does not bring them along: without this the copy would
+ * display the bare message and the traceback module would print no file, no
+ * line and no caret at all.  Returns 0 when any of them cannot be carried
+ * over, which leaves the caller to print the original message.
+ */
+static int
+set_syntax_error_message(PyObject *value, PyObject *copy,
+                         PyObject *replacement)
+{
+    if (PyObject_SetAttrString(copy, "msg", replacement) < 0) {
+        PyErr_Clear();
+        return 0;
+    }
+    for (const char *const *name = syntax_error_location;
+         *name != NULL; name++) {
+        PyObject *field = PyObject_GetAttrString(value, *name);
+        if (field == NULL) {
+            PyErr_Clear();
+            return 0;
+        }
+        if (field != Py_None
+            && PyObject_SetAttrString(copy, *name, field) < 0) {
+            PyErr_Clear();
+            Py_DECREF(field);
+            return 0;
+        }
+        Py_DECREF(field);
+    }
+    return 1;
+}
+
+/*
+ * Does `copy` display the replacement?
+ *
+ * exception_with_message() writes the new text into args[0], and that only
+ * reaches the display when the type renders args[0].  A type that builds its
+ * text some other way shows something else instead: UnicodeDecodeError shows
+ * the empty string (its __str__ needs the `object` member, which a copy built
+ * with __new__ never gets), an OSError carrying errno shows the repr of its
+ * whole args tuple, KeyError shows repr() of the message, and a type with its
+ * own __str__ shows its own fixed text.  Printing any of those would lose the
+ * message the user needs or wrap the replacement in quotes, so the rewrite is
+ * accepted only when the copy displays exactly the replacement.
+ *
+ * SyntaxError is the one type that appends something of its own, the location
+ * ("<msg> (<file>, line N)"), so there the display has to start with the new
+ * message.
+ *
+ * Returns 1 when the display is right, 0 when the rewrite has to be dropped.
+ */
+static int
+copy_shows_replacement(PyObject *value, PyObject *copy, PyObject *replacement)
+{
+    PyObject *shown = PyObject_Str(copy);
+    if (shown == NULL) {
+        PyErr_Clear();
+        return 0;
+    }
+
+    int ok = 0;
+    if (PyUnicode_Check(shown)) {
+        int cmp = PyUnicode_Compare(shown, replacement);
+        if (cmp == 0) {
+            ok = 1;
+        }
+        else if (PyErr_Occurred()) {
+            PyErr_Clear();          /* the comparison failed: no rewrite */
+        }
+        else if (PyObject_TypeCheck(value,
+                                    (PyTypeObject *)PyExc_SyntaxError)) {
+            Py_ssize_t at = PyUnicode_Find(shown, replacement, 0,
+                                           PY_SSIZE_T_MAX, 1);
+            if (at == 0) {
+                ok = 1;             /* the message, then the location */
+            }
+            else if (at < 0) {
+                PyErr_Clear();      /* not found, or -2 with an error set */
+            }
+        }
+    }
+    else {
+        PyErr_Clear();
+    }
+    Py_DECREF(shown);
+    return ok;
+}
+
+/*
  * Show `replacement` instead of the message `value` carries.
  *
  * Returns a NEW reference to the rewritten copy, or NULL when this exception
- * cannot be rewritten.  SyntaxError keeps its message in .msg and its location
- * in args[1], so both fields are updated there.
+ * cannot be rewritten, either because the copy cannot be built or because it
+ * would not display the replacement.  SyntaxError keeps its message in .msg
+ * and its location in the fields listed above, so both are updated there.
  */
 static PyObject *
 exception_with_message(PyObject *value, PyObject *replacement)
@@ -521,13 +1605,121 @@ exception_with_message(PyObject *value, PyObject *replacement)
     }
     Py_DECREF(newargs);
 
-    if (PyObject_TypeCheck(value, (PyTypeObject *)PyExc_SyntaxError)) {
-        if (PyObject_SetAttrString(copy, "msg", replacement) < 0) {
-            PyErr_Clear();
-        }
+    if (PyObject_TypeCheck(value, (PyTypeObject *)PyExc_SyntaxError)
+        && !set_syntax_error_message(value, copy, replacement)) {
+        Py_DECREF(copy);
+        return NULL;
+    }
+
+    if (!copy_shows_replacement(value, copy, replacement)) {
+        /* The copy would show something other than the replacement, so this
+           type does not display what the table rewrote: keep the original. */
+        Py_DECREF(copy);
+        return NULL;
     }
 
     return copy;
+}
+
+/* ------------------------------------------------------------------ */
+/* lookup                                                              */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The replacement of a literal entry whose key equals `text`, or NULL.
+ *
+ * The comparison stays on the str objects (PyUnicode_Compare), so a literal
+ * entry keeps matching exactly what it matched before patterns existed.
+ */
+static PyObject *
+literal_replacement(MessageTable *table, PyObject *text)
+{
+    for (Py_ssize_t i = 0; i < table->count; i++) {
+        MessageEntry *entry = &table->entries[i];
+        if (entry->star_count != 0) {
+            continue;               /* a pattern, not a literal message */
+        }
+        int cmp = PyUnicode_Compare(text, entry->key);
+        if (cmp < 0) {
+            PyErr_Clear();          /* comparison failure: no match */
+            continue;
+        }
+        if (cmp == 0) {
+            return Py_NewRef(entry->value);
+        }
+    }
+    return NULL;
+}
+
+/*
+ * The text of the pattern entry that applies to `text`, or NULL.
+ *
+ * Patterns are tried only after every literal key has failed, and the winner
+ * is the matching pattern with the fewest wildcards; an equal count is decided
+ * by position in the table, which is the order this scan visits entries in.
+ */
+static PyObject *
+pattern_replacement(MessageTable *table, PyObject *text)
+{
+    if (table->pattern_count == 0) {
+        /* A table of literal keys alone: nothing to do, and no reason to build
+           the UTF-8 form of a text that no pattern will be matched against. */
+        return NULL;
+    }
+    Py_ssize_t text_size = 0;
+    const char *text_utf8 = PyUnicode_AsUTF8AndSize(text, &text_size);
+    if (text_utf8 == NULL) {
+        /* A str holding a lone surrogate has no UTF-8 form, so there are no
+           bytes to match against: keep the message. */
+        PyErr_Clear();
+        return NULL;
+    }
+
+    MessageEntry *winner = NULL;
+    size_t fewest = (size_t)-1;
+    for (Py_ssize_t i = 0; i < table->count; i++) {
+        MessageEntry *entry = &table->entries[i];
+        if (entry->star_count == 0 || entry->star_count >= fewest) {
+            continue;               /* cannot beat the pattern that matched */
+        }
+        if (!pattern_match(entry->key_utf8, (size_t)entry->key_utf8_size,
+                           text_utf8, (size_t)text_size,
+                           entry->star_count, NULL)) {
+            continue;
+        }
+        winner = entry;
+        fewest = entry->star_count;
+    }
+    if (winner == NULL) {
+        return NULL;
+    }
+
+    /* Match the winner again, now collecting the runs: the scan above cannot
+       keep them, because a closer match would overwrite the buffer. */
+    size_t captures[2 * MESSAGE_PATTERN_MAX_STARS];
+    if (!pattern_match(winner->key_utf8, (size_t)winner->key_utf8_size,
+                       text_utf8, (size_t)text_size, winner->star_count,
+                       captures)) {
+        return NULL;
+    }
+
+    char *expanded = NULL;
+    size_t expanded_size = 0;
+    if (!pattern_expand(winner->value_utf8, (size_t)winner->value_utf8_size,
+                        text_utf8, captures, winner->star_count,
+                        &expanded, &expanded_size)) {
+        /* The replacement names a capture the pattern does not have: keep the
+           original message instead of inventing text. */
+        return NULL;
+    }
+    PyObject *result = PyUnicode_DecodeUTF8(expanded,
+                                            (Py_ssize_t)expanded_size,
+                                            "replace");
+    free(expanded);
+    if (result == NULL) {
+        PyErr_Clear();
+    }
+    return result;
 }
 
 /* ------------------------------------------------------------------ */
@@ -558,24 +1750,18 @@ _PyErr_Message_Replace(PyObject *value)
         return NULL;
     }
 
-    PyObject *replacement = NULL;
-    for (Py_ssize_t i = 0; i < table->count; i++) {
-        int cmp = PyUnicode_Compare(text, table->entries[i].key);
-        if (cmp < 0) {
-            PyErr_Clear();            /* comparison failure: no match */
-            continue;
-        }
-        if (cmp == 0) {
-            replacement = table->entries[i].value;
-            break;
-        }
+    PyObject *replacement = literal_replacement(table, text);
+    if (replacement == NULL) {
+        replacement = pattern_replacement(table, text);
     }
     Py_DECREF(text);
-
     if (replacement == NULL) {
         return NULL;
     }
-    return exception_with_message(value, replacement);
+
+    PyObject *result = exception_with_message(value, replacement);
+    Py_DECREF(replacement);
+    return result;
 }
 
 /* Reload the table from disk; returns the entry count.  For tests. */
@@ -587,3 +1773,5 @@ _PyMessageTable_Reload(void)
     MessageTable *table = message_table_get();
     return table == NULL ? 0 : table->count;
 }
+
+#endif /* !MESSAGE_TABLE_NO_PYTHON */
