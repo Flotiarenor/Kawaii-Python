@@ -119,7 +119,7 @@
     <PyDebugExt Condition="'$(PyDebugExt)' == '' and $(Configuration) == 'Debug'">_d</PyDebugExt>
 
     <!-- Suffix for versions/keys when building with test markers -->
-    <PyTestExt Condition="$(UseTestMarker) == 'true'">-test</PyTestExt>
+    <PyTestExt Condition="$(UseTestMarker) == 'true'">-kawaii</PyTestExt>
 
     <!-- Suffix for versions/keys when building for particular platforms -->
     <PyArchExt Condition="'$(ArchName)' == 'win32'">-32</PyArchExt>
