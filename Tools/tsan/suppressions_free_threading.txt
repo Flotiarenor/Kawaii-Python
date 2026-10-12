@@ -8,5 +8,24 @@
 # that describes how to reproduce the race and includes the relevant TSan
 # output.
 
-# There are currently no active suppressions. This file is kept so tooling
-# that expects it can still find it.
+# The race is inside OpenSSL, not in CPython: hash.pbkdf2_hmac() reaches
+# PKCS5_PBKDF2_HMAC(), whose comparison of precomputed HMAC values is reported
+# as a read/write pair on the same address between two threads running the
+# "parallel tests" step of the TSan job.  Upstream tracks OpenSSL binding races
+# in gh-143756 (https://github.com/python/cpython/issues/143756).
+#
+# Suppressed here rather than skipped in CI so that the parallel test step keeps
+# running the rest of the suite.  Reproduce with:
+#   ./python -m test --tsan-parallel --parallel-threads=4 -j4
+# TSan output (Actions run 38178124237, job 114585198438):
+#   WARNING: ThreadSanitizer: data race (pid=32233)
+#     Read of size 8 at 0x721c00011ac8 by thread T457:
+#       #0 memcmp
+#       #1 libcrypto.so.3+0x24f351
+#       #2 pbkdf2_hmac Modules/clinic/_hashopenssl.c.h:1490:20
+#     Previous write of size 8 at 0x721c00011ac8 by thread T456:
+#       #0 memcpy
+#       #1 libcrypto.so.3+0x24f166
+#       #2 pbkdf2_hmac Modules/clinic/_hashopenssl.c.h:1490:20
+race:^pbkdf2_hmac$
+
